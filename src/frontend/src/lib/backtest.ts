@@ -33,7 +33,8 @@ function isNum(arr: (number | null)[], i: number): boolean {
 
 /**
  * Compute rolling percentile over a window ending at index i.
- * Returns null if fewer than 5 valid values are available.
+ * Uses all available valid values in the window — no minimum row requirement.
+ * Returns null only if there are zero valid values.
  */
 function rollingPercentile(
   arr: (number | null)[],
@@ -45,7 +46,7 @@ function rollingPercentile(
   for (let j = Math.max(0, i - windowSize + 1); j <= i; j++) {
     if (arr[j] !== null && !Number.isNaN(arr[j])) slice.push(arr[j] as number);
   }
-  if (slice.length < 2) return null;
+  if (slice.length === 0) return null;
   slice.sort((a, b) => a - b);
   const idx = Math.floor(pct * (slice.length - 1));
   return slice[idx];
@@ -133,21 +134,20 @@ export function runBacktest(
     } else {
       // --- Divergence-Decay Exit Protocol ---
 
-      // Dynamic thresholds: rolling 85th percentile over last 50 bars
+      // Rule Alpha: dynamic upper threshold = rolling 85th percentile (window 50)
+      // No fallback to fixed levels — threshold is null only when zero data available
       const T_RSI_upper = rollingPercentile(rsi, i, 50, 0.85);
       const T_MFI_upper = rollingPercentile(mfi, i, 50, 0.85);
 
-      // Rule Alpha — momentum peak identification
-      // Use dynamic rolling 85th-percentile threshold; fall back to fixed overbought levels
-      // (RSI > 70, MFI > 80) when insufficient history is available.
-      const effectiveRSIThreshold = T_RSI_upper ?? 70;
-      const effectiveMFIThreshold = T_MFI_upper ?? 80;
+      // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold
       const ruleAlpha =
-        (isNum(rsi, i) && getNum(rsi, i) > effectiveRSIThreshold) ||
-        (isNum(mfi, i) && getNum(mfi, i) > effectiveMFIThreshold);
+        (T_RSI_upper !== null &&
+          isNum(rsi, i) &&
+          getNum(rsi, i) > T_RSI_upper) ||
+        (T_MFI_upper !== null && isNum(mfi, i) && getNum(mfi, i) > T_MFI_upper);
 
       if (ruleAlpha) {
-        // Update (overwrite) peak state with the most recent overbought peak
+        // Record the peak (overwrite with most recent if multiple peaks occur)
         alphaPeakIdx = i;
         alphaPeakPrice = bar.close;
         alphaPeakRSI = isNum(rsi, i) ? getNum(rsi, i) : null;
@@ -156,6 +156,7 @@ export function runBacktest(
 
       let exitReason = "";
 
+      // Final Execution only evaluates AFTER a peak has been established
       if (
         alphaPeakIdx !== null &&
         alphaPeakPrice !== null &&
@@ -163,14 +164,14 @@ export function runBacktest(
         alphaPeakMACD !== null &&
         i > alphaPeakIdx
       ) {
-        // Rule Beta — ROC21 day-over-day deceleration
+        // Rule Beta — ROC21(t) < ROC21(t-1): current day deceleration
         const ruleBeta =
           i >= 1 &&
           isNum(roc21, i) &&
           isNum(roc21, i - 1) &&
           getNum(roc21, i) < getNum(roc21, i - 1);
 
-        // Rule Gamma — price/RSI/MACD divergence vs peak
+        // Rule Gamma — price >= peak AND RSI < peak RSI AND MACD < peak MACD
         const ruleGamma =
           isNum(rsi, i) &&
           isNum(macd, i) &&
@@ -178,7 +179,7 @@ export function runBacktest(
           getNum(rsi, i) < alphaPeakRSI &&
           getNum(macd, i) < alphaPeakMACD;
 
-        // Final Execution — all three conditions simultaneously
+        // Final Execution — all three align
         if (ruleBeta && ruleGamma) {
           exitReason = "Divergence-Decay Exit";
         }

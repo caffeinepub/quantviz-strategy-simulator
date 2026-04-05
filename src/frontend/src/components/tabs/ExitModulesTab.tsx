@@ -20,12 +20,12 @@ interface ExitModulesTabProps {
 
 /**
  * Compute rolling percentile over the last `window` values ending at the
- * tail of `arr`. Returns null if fewer than 5 valid values are available.
+ * tail of `arr`. Returns null only when zero valid values are available.
+ * No minimum row requirement — works with any dataset size.
  */
 function rollingPct(arr: number[], window: number, pct: number): number | null {
-  if (arr.length < 5) return null;
   const slice = arr.slice(-window).filter((v) => !Number.isNaN(v));
-  if (slice.length < 5) return null;
+  if (slice.length === 0) return null;
   const s = [...slice].sort((a, b) => a - b);
   return s[Math.floor(pct * (s.length - 1))];
 }
@@ -53,15 +53,16 @@ export function ExitModulesTab({
   const T_RSI = rollingPct(rsiHistory, 50, 0.85);
   const T_MFI = rollingPct(mfiHistory, 50, 0.85);
 
-  // Rule Alpha — momentum peak identification
+  // Rule Alpha — RSI OR MFI breaches adaptive upper threshold
+  // No fallback to fixed levels; threshold is only unavailable when zero data exists
   const alphaFired =
     (T_RSI !== null && d.rsi > T_RSI) || (T_MFI !== null && d.mfi > T_MFI);
   const hasPeak = alphaPeak !== null;
 
-  // Rule Beta — ROC21 day-over-day deceleration
+  // Rule Beta — ROC21(t) < ROC21(t-1)
   const betaFired = p !== null && d.roc21 < p.roc21;
 
-  // Rule Gamma — price/RSI/MACD divergence vs peak (only meaningful if peak exists and after it)
+  // Rule Gamma — price >= peak price AND RSI < peak RSI AND MACD < peak MACD
   const gammaFired =
     hasPeak &&
     currentDay > alphaPeak!.idx &&
@@ -69,7 +70,7 @@ export function ExitModulesTab({
     d.rsi < alphaPeak!.rsi &&
     d.macd < alphaPeak!.macd;
 
-  // Final Execution
+  // Final Execution — Alpha peak established + Beta + Gamma all align
   const finalFired = hasPeak && betaFired && gammaFired && inPosition;
 
   // Re-entry scanner state
@@ -98,15 +99,15 @@ export function ExitModulesTab({
         status={alphaFired ? "TRIGGERED" : hasPeak ? "ARMED" : "MONITORING"}
         conditions={[
           {
-            label: "RSI > Dynamic Upper (85th pct)",
+            label: "RSI > Dynamic Upper (85th pct, rolling 50)",
             current: d.rsi.toFixed(1),
-            threshold: T_RSI !== null ? T_RSI.toFixed(1) : "calculating…",
+            threshold: T_RSI !== null ? T_RSI.toFixed(1) : "no data",
             met: T_RSI !== null && d.rsi > T_RSI,
           },
           {
-            label: "MFI > Dynamic Upper (85th pct)",
+            label: "MFI > Dynamic Upper (85th pct, rolling 50)",
             current: d.mfi.toFixed(1),
-            threshold: T_MFI !== null ? T_MFI.toFixed(1) : "calculating…",
+            threshold: T_MFI !== null ? T_MFI.toFixed(1) : "no data",
             met: T_MFI !== null && d.mfi > T_MFI,
           },
           {
@@ -131,7 +132,7 @@ export function ExitModulesTab({
         }
         conditions={[
           {
-            label: "ROC21 Decelerating",
+            label: "ROC21(t) < ROC21(t-1)",
             current: `${d.roc21.toFixed(2)}%`,
             threshold: `< ${p?.roc21.toFixed(2) ?? "prev"}%`,
             met: betaFired,

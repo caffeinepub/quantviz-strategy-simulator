@@ -173,6 +173,7 @@ export default function App() {
         // --- Divergence-Decay Exit Protocol ---
 
         // Dynamic thresholds: rolling 85th percentile over last 50 bars
+        // Returns null only when zero valid data points exist (slice.length === 0)
         const rollingPctFromArr = (
           field: keyof typeof d,
           upToIdx: number,
@@ -184,7 +185,7 @@ export default function App() {
             const v = arr[j]?.[field] as number;
             if (v !== undefined && !Number.isNaN(v)) slice.push(v);
           }
-          if (slice.length < 2) return null;
+          if (slice.length === 0) return null;
           slice.sort((a, b) => a - b);
           return slice[Math.floor(pct * (slice.length - 1))];
         };
@@ -192,13 +193,11 @@ export default function App() {
         const T_RSI_upper = rollingPctFromArr("rsi", dayIdx, 50, 0.85);
         const T_MFI_upper = rollingPctFromArr("mfi", dayIdx, 50, 0.85);
 
-        // Rule Alpha — momentum peak identification
-        // Use dynamic rolling 85th-percentile threshold; fall back to fixed overbought levels
-        // (RSI > 70, MFI > 80) when insufficient history is available.
-        const effectiveRSIThreshold = T_RSI_upper ?? 70;
-        const effectiveMFIThreshold = T_MFI_upper ?? 80;
+        // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold
+        // No fixed fallback: threshold is only unavailable when zero data exists
         const ruleAlpha =
-          d.rsi > effectiveRSIThreshold || d.mfi > effectiveMFIThreshold;
+          (T_RSI_upper !== null && d.rsi > T_RSI_upper) ||
+          (T_MFI_upper !== null && d.mfi > T_MFI_upper);
 
         if (ruleAlpha) {
           alphaPeakRef.current = {
@@ -210,7 +209,7 @@ export default function App() {
           setAlphaPeak(alphaPeakRef.current);
           addAlert({
             day: dayIdx,
-            message: `Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${effectiveRSIThreshold.toFixed(1)} | MFI ${d.mfi.toFixed(1)} vs threshold ${effectiveMFIThreshold.toFixed(1)}`,
+            message: `Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"}`,
             level: "warning",
           });
         }
