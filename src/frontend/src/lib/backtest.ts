@@ -134,10 +134,17 @@ export function runBacktest(
     } else {
       // --- Divergence-Decay Exit Protocol ---
 
-      // Rule Alpha: dynamic upper threshold = rolling 85th percentile (window 50)
-      // No fallback to fixed levels — threshold is null only when zero data available
+      // Dynamic upper threshold = rolling 85th percentile (window 50)
       const T_RSI_upper = rollingPercentile(rsi, i, 50, 0.85);
       const T_MFI_upper = rollingPercentile(mfi, i, 50, 0.85);
+
+      // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
+      // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
+      // (computed but used only for state reporting; does not block the existing trade)
+      void (
+        (T_RSI_upper === null || getNum(rsi, i) <= T_RSI_upper) &&
+        (T_MFI_upper === null || getNum(mfi, i) <= T_MFI_upper)
+      );
 
       // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold
       const ruleAlpha =

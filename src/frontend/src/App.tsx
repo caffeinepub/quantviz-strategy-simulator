@@ -193,7 +193,25 @@ export default function App() {
         const T_RSI_upper = rollingPctFromArr("rsi", dayIdx, 50, 0.85);
         const T_MFI_upper = rollingPctFromArr("mfi", dayIdx, 50, 0.85);
 
-        // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold
+        // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
+        // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
+        const ruleZeroAvoid =
+          (T_RSI_upper === null || d.rsi <= T_RSI_upper) &&
+          (T_MFI_upper === null || d.mfi <= T_MFI_upper);
+
+        const prevHadPeak = alphaPeakRef.current !== null;
+
+        if (ruleZeroAvoid && !prevHadPeak) {
+          // AVOID state is active — log it
+          addLog({
+            day: dayIdx,
+            type: "info",
+            message: `AVOID — RSI ${d.rsi.toFixed(1)} ≤ ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} ≤ ${T_MFI_upper?.toFixed(1) ?? "n/a"} | Both below adaptive threshold`,
+            module: "avoid",
+          });
+        }
+
+        // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold (cancels AVOID)
         // No fixed fallback: threshold is only unavailable when zero data exists
         const ruleAlpha =
           (T_RSI_upper !== null && d.rsi > T_RSI_upper) ||
@@ -209,8 +227,14 @@ export default function App() {
           setAlphaPeak(alphaPeakRef.current);
           addAlert({
             day: dayIdx,
-            message: `Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"}`,
+            message: `AVOID CLEARED — Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"} | System enters TRACKING state`,
             level: "warning",
+          });
+          addLog({
+            day: dayIdx,
+            type: "info",
+            message: `TRACKING — Rule Alpha fired, AVOID cleared. Peak @ $${d.price.toFixed(2)} | RSI ${d.rsi.toFixed(1)} | MFI ${d.mfi.toFixed(1)}`,
+            module: "alpha",
           });
         }
 

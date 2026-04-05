@@ -53,8 +53,13 @@ export function ExitModulesTab({
   const T_RSI = rollingPct(rsiHistory, 50, 0.85);
   const T_MFI = rollingPct(mfiHistory, 50, 0.85);
 
-  // Rule Alpha — RSI OR MFI breaches adaptive upper threshold
-  // No fallback to fixed levels; threshold is only unavailable when zero data exists
+  // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
+  // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
+  const ruleZeroAvoid =
+    (T_RSI === null || d.rsi <= T_RSI) && (T_MFI === null || d.mfi <= T_MFI);
+
+  // Rule Alpha — RSI OR MFI breaches adaptive upper threshold (cancels AVOID)
+  // I_alpha(t) = RSI(t) > T_RSI_upper(t) OR MFI(t) > T_MFI_upper(t)
   const alphaFired =
     (T_RSI !== null && d.rsi > T_RSI) || (T_MFI !== null && d.mfi > T_MFI);
   const hasPeak = alphaPeak !== null;
@@ -72,6 +77,14 @@ export function ExitModulesTab({
 
   // Final Execution — Alpha peak established + Beta + Gamma all align
   const finalFired = hasPeak && betaFired && gammaFired && inPosition;
+
+  // Algorithm state machine:
+  // EXIT > TRACKING > AVOID (priority order)
+  const algoState: "AVOID" | "TRACKING" | "EXIT" = finalFired
+    ? "EXIT"
+    : hasPeak
+      ? "TRACKING"
+      : "AVOID";
 
   // Re-entry scanner state
   const isCooling =
@@ -92,6 +105,74 @@ export function ExitModulesTab({
 
   return (
     <div className="space-y-2">
+      {/* ── Algorithm State Banner ── */}
+      <div
+        className={`rounded-lg border px-4 py-3 text-sm font-bold flex items-center gap-3 ${
+          algoState === "EXIT"
+            ? "bg-destructive/15 border-destructive/60 text-destructive"
+            : algoState === "TRACKING"
+              ? "bg-cyan-500/10 border-cyan-500/50 text-cyan-400"
+              : "bg-amber-500/10 border-amber-500/50 text-amber-400"
+        }`}
+        data-ocid="exit_modules.algo_state.banner"
+      >
+        <span
+          className={`w-3 h-3 rounded-full flex-shrink-0 animate-pulse ${
+            algoState === "EXIT"
+              ? "bg-destructive"
+              : algoState === "TRACKING"
+                ? "bg-cyan-400"
+                : "bg-amber-400"
+          }`}
+        />
+        <span className="uppercase tracking-wider text-xs">
+          {algoState === "EXIT" &&
+            "🚨 ALGORITHM STATE: EXIT — LIQUIDATE POSITION"}
+          {algoState === "TRACKING" &&
+            "📡 ALGORITHM STATE: TRACKING — Peak Identified, Monitoring Beta+Gamma"}
+          {algoState === "AVOID" &&
+            "⛔ ALGORITHM STATE: AVOID — Low Momentum, Do Not Enter"}
+        </span>
+        <span className="ml-auto text-[10px] font-mono">
+          0:{ruleZeroAvoid ? "✓" : "✗"} α:
+          {hasPeak ? "✓" : alphaFired ? "⚡" : "✗"} β:{betaFired ? "✓" : "✗"} γ:
+          {gammaFired ? "✓" : "✗"}
+        </span>
+      </div>
+
+      {/* Rule Zero card */}
+      <ExitModuleCard
+        title="Rule 0 · Capital Preservation (AVOID Signal)"
+        accent="oklch(0.75 0.18 85)"
+        status={ruleZeroAvoid ? "ACTIVE" : "CLEARED"}
+        conditions={[
+          {
+            label: "RSI ≤ Dynamic Upper (85th pct, rolling 50)",
+            current: d.rsi.toFixed(1),
+            threshold:
+              T_RSI !== null ? `≤ ${T_RSI.toFixed(1)}` : "computing...",
+            met: T_RSI === null || d.rsi <= T_RSI,
+          },
+          {
+            label: "MFI ≤ Dynamic Upper (85th pct, rolling 50)",
+            current: d.mfi.toFixed(1),
+            threshold:
+              T_MFI !== null ? `≤ ${T_MFI.toFixed(1)}` : "computing...",
+            met: T_MFI === null || d.mfi <= T_MFI,
+          },
+          {
+            label: "AVOID Signal Output",
+            current: ruleZeroAvoid
+              ? "ACTIVE — Block entry"
+              : "CLEARED — Alpha triggered",
+            threshold: "Both conditions must hold",
+            met: !ruleZeroAvoid,
+          },
+        ]}
+        expanded
+        onToggle={() => {}}
+      />
+
       {/* Rule Alpha card */}
       <ExitModuleCard
         title="Rule α · Momentum Peak Identification"

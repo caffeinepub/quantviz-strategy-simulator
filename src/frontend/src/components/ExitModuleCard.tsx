@@ -10,7 +10,7 @@ interface Condition {
 interface ExitModuleCardProps {
   title: string;
   accent: string;
-  status: "MONITORING" | "ARMED" | "TRIGGERED";
+  status: "MONITORING" | "ARMED" | "TRIGGERED" | "ACTIVE" | "CLEARED";
   conditions: Condition[];
   expanded: boolean;
   onToggle: () => void;
@@ -29,7 +29,11 @@ export function ExitModuleCard({
       ? "bg-destructive/20 text-destructive border-destructive/30"
       : status === "ARMED"
         ? "bg-warning/20 text-warning border-warning/30"
-        : "bg-muted/30 text-muted-foreground border-border";
+        : status === "ACTIVE"
+          ? "bg-amber-500/20 text-amber-400 border-amber-500/30"
+          : status === "CLEARED"
+            ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
+            : "bg-muted/30 text-muted-foreground border-border";
 
   const glowStyle =
     status === "TRIGGERED"
