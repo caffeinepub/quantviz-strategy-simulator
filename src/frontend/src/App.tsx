@@ -74,6 +74,12 @@ export default function App() {
   const [coolingOffUntilDay, setCoolingOffUntilDay] = useState<number | null>(
     null,
   );
+  const [alphaPeak, setAlphaPeak] = useState<{
+    idx: number;
+    price: number;
+    rsi: number;
+    macd: number;
+  } | null>(null);
 
   // Auto-fetch state
   const [stockSymbol, setStockSymbol] = useState("");
@@ -81,6 +87,7 @@ export default function App() {
   const [toDate, setToDate] = useState(todayStr);
   const [fetchLoading, setFetchLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [pasteError, setPasteError] = useState<string | null>(null);
 
   // Refs to avoid stale closures
   const inPositionRef = useRef(true);
@@ -92,6 +99,12 @@ export default function App() {
   const dataRef = useRef<DayData[]>(SAMPLE_DATA);
   const coolingOffUntilDayRef = useRef<number | null>(null);
   const lastExitPriceRef = useRef<number | null>(null);
+  const alphaPeakRef = useRef<{
+    idx: number;
+    price: number;
+    rsi: number;
+    macd: number;
+  } | null>(null);
 
   // Keep refs in sync
   useEffect(() => {
@@ -155,55 +168,72 @@ export default function App() {
       const arr = dataRef.current;
       const d = arr[dayIdx];
       const prev = dayIdx >= 1 ? arr[dayIdx - 1] : null;
-      const prev2 = dayIdx >= 2 ? arr[dayIdx - 2] : null;
 
       if (inPositionRef.current) {
-        // HOLD check
-        const momDrop3 =
-          dayIdx >= 3 ? arr[dayIdx - 3].momentum - d.momentum : 0;
-        const hold = d.rsi >= 48 && d.roc21 > -5 && momDrop3 <= 5;
+        // --- Divergence-Decay Exit Protocol ---
+
+        // Dynamic thresholds: rolling 85th percentile over last 50 bars
+        const rollingPctFromArr = (
+          field: keyof typeof d,
+          upToIdx: number,
+          window: number,
+          pct: number,
+        ): number | null => {
+          const slice: number[] = [];
+          for (let j = Math.max(0, upToIdx - window + 1); j <= upToIdx; j++) {
+            const v = arr[j]?.[field] as number;
+            if (v !== undefined && !Number.isNaN(v)) slice.push(v);
+          }
+          if (slice.length < 2) return null;
+          slice.sort((a, b) => a - b);
+          return slice[Math.floor(pct * (slice.length - 1))];
+        };
+
+        const T_RSI_upper = rollingPctFromArr("rsi", dayIdx, 50, 0.85);
+        const T_MFI_upper = rollingPctFromArr("mfi", dayIdx, 50, 0.85);
+
+        // Rule Alpha — momentum peak identification
+        // Use dynamic rolling 85th-percentile threshold; fall back to fixed overbought levels
+        // (RSI > 70, MFI > 80) when insufficient history is available.
+        const effectiveRSIThreshold = T_RSI_upper ?? 70;
+        const effectiveMFIThreshold = T_MFI_upper ?? 80;
+        const ruleAlpha =
+          d.rsi > effectiveRSIThreshold || d.mfi > effectiveMFIThreshold;
+
+        if (ruleAlpha) {
+          alphaPeakRef.current = {
+            idx: dayIdx,
+            price: d.price,
+            rsi: d.rsi,
+            macd: d.macd,
+          };
+          setAlphaPeak(alphaPeakRef.current);
+          addAlert({
+            day: dayIdx,
+            message: `Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${effectiveRSIThreshold.toFixed(1)} | MFI ${d.mfi.toFixed(1)} vs threshold ${effectiveMFIThreshold.toFixed(1)}`,
+            level: "warning",
+          });
+        }
 
         let exitReason = "";
-        if (!hold) {
-          if (d.roc21 > 15 && (d.rsi > 75 || d.mfi > 80)) {
-            exitReason = "Profit-Take";
-          } else if (
-            prev &&
-            prev2 &&
-            d.roc21 < 0 &&
-            d.momentum < prev.momentum &&
-            prev.momentum < prev2.momentum &&
-            prev2.momentum - d.momentum > 8
-          ) {
-            exitReason = "Momentum Collapse";
-          } else if (
-            prev &&
-            prev2 &&
-            d.rsi > 72 &&
-            d.rsi < prev.rsi &&
-            prev.rsi < prev2.rsi &&
-            d.mfi < 50
-          ) {
-            exitReason = "RSI Divergence";
-          } else if (
-            prev &&
-            d.macd < 0 &&
-            d.mfi < 45 &&
-            d.momentum < prev.momentum
-          ) {
-            exitReason = "MACD+MFI Weak";
-          } else if (d.roc21 < -3 && (d.rsi < 45 || d.mfi < 45)) {
-            exitReason = "Multi-Weak";
-          } else if (d.roc21 < -9) {
-            exitReason = "Hard Floor";
+
+        if (
+          alphaPeakRef.current !== null &&
+          dayIdx > alphaPeakRef.current.idx
+        ) {
+          const peak = alphaPeakRef.current;
+
+          // Rule Beta — ROC21 day-over-day deceleration
+          const ruleBeta = prev !== null && d.roc21 < prev.roc21;
+
+          // Rule Gamma — price/RSI/MACD divergence vs peak
+          const ruleGamma =
+            d.price >= peak.price && d.rsi < peak.rsi && d.macd < peak.macd;
+
+          // Final Execution — all three conditions simultaneously
+          if (ruleBeta && ruleGamma) {
+            exitReason = "Divergence-Decay Exit";
           }
-        } else {
-          addLog({
-            day: dayIdx,
-            type: "hold",
-            message: `HOLD — RSI ${d.rsi.toFixed(1)} ≥ 48, ROC21 ${d.roc21.toFixed(1)} > -5, MomDrop ${momDrop3.toFixed(1)} ≤ 5`,
-            module: "hold",
-          });
         }
 
         if (exitReason && openTradeRef.current) {
@@ -226,38 +256,21 @@ export default function App() {
             message: `EXIT [${exitReason}] @ $${d.price.toFixed(2)} | P&L ${pnlPct.toFixed(2)}%`,
             module: exitReason,
           });
+          addAlert({
+            day: dayIdx,
+            message:
+              "DIVERGENCE-DECAY EXIT triggered — Beta+Gamma alignment confirmed",
+            level: "critical",
+          });
           // Store exit price for use as re-entry price
           lastExitPriceRef.current = d.price;
           // Start cooling-off period: wait 3 days before scanning for re-entry
           const coolUntil = dayIdx + 3;
           setCoolingOffUntilDay(coolUntil);
           coolingOffUntilDayRef.current = coolUntil;
-        }
-
-        // Alert conditions
-        if (d.roc21 < -1 && d.roc21 > -3) {
-          addAlert({
-            day: dayIdx,
-            message: `ROC21 ${d.roc21.toFixed(1)}% approaching Multi-Weak threshold (-3)`,
-            level: "warning",
-          });
-          if (coolingOffUntilDayRef.current === null) {
-            const coolUntil = dayIdx + 3;
-            setCoolingOffUntilDay(coolUntil);
-            coolingOffUntilDayRef.current = coolUntil;
-          }
-        }
-        if (d.macd < 0 && d.mfi < 55) {
-          addAlert({
-            day: dayIdx,
-            message: `MACD ${d.macd.toFixed(2)} negative, MFI ${d.mfi.toFixed(1)} weakening`,
-            level: "warning",
-          });
-          if (coolingOffUntilDayRef.current === null) {
-            const coolUntil = dayIdx + 3;
-            setCoolingOffUntilDay(coolUntil);
-            coolingOffUntilDayRef.current = coolUntil;
-          }
+          // Clear alpha peak state after exit
+          alphaPeakRef.current = null;
+          setAlphaPeak(null);
         }
       } else {
         // Not in position — handle re-entry logic
@@ -337,6 +350,8 @@ export default function App() {
     setCoolingOffUntilDay(null);
     coolingOffUntilDayRef.current = null;
     lastExitPriceRef.current = null;
+    alphaPeakRef.current = null;
+    setAlphaPeak(null);
 
     if (d.length > 0) {
       const autoTrade: TradeRecord = { entryDay: 0, entryPrice: d[0].price };
@@ -472,28 +487,157 @@ export default function App() {
     }
   }
 
-  function handleLoadData() {
-    const lines = rawInput.trim().split("\n").filter(Boolean);
-    const parsed: DayData[] = lines
-      .map((line) => {
-        const cols = line.split(/[\t,]+/);
-        if (cols.length < 6) return null;
-        return {
-          price: Number.parseFloat(cols[0]),
-          roc21: Number.parseFloat(cols[1]),
-          rsi: Number.parseFloat(cols[2]),
-          macd: Number.parseFloat(cols[3]),
-          mfi: Number.parseFloat(cols[4]),
-          momentum: Number.parseFloat(cols[5]),
-        } as DayData;
-      })
-      .filter((d): d is DayData => d !== null && !Number.isNaN(d.price));
-    if (parsed.length > 0) {
-      resetAll(parsed);
-      setDataInputOpen(false);
+  async function handleLoadData() {
+    setPasteError(null);
+
+    // Normalize line endings and collect non-empty lines
+    const lines = rawInput
+      .trim()
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")
+      .filter((l) => l.trim().length > 0);
+
+    if (lines.length === 0) {
+      setPasteError("No data found. Please paste your data above.");
+      return;
+    }
+
+    // Helper: split a line by tab, comma, or multiple spaces
+    function splitCols(line: string): string[] {
+      if (line.includes("\t")) return line.split(/\t+/).map((c) => c.trim());
+      if (line.includes(",")) return line.split(/,+/).map((c) => c.trim());
+      return line
+        .trim()
+        .split(/\s+/)
+        .map((c) => c.trim());
+    }
+
+    const firstLine = lines[0];
+    const firstCols = splitCols(firstLine);
+    const firstField = (firstCols[0] ?? "").trim().toLowerCase();
+
+    // Step 1: Is the first token a valid positive number? → Format A, no header to skip
+    const firstNum = Number.parseFloat(firstField);
+    const isNumericFirst = !Number.isNaN(firstNum) && firstNum > 0;
+
+    // Step 2: Is the first token a known pre-computed indicator header keyword?
+    const PRECOMPUTED_HEADERS = [
+      "price",
+      "roc",
+      "rsi",
+      "macd",
+      "mfi",
+      "momentum",
+    ];
+    const isPrecomputedHeader = PRECOMPUTED_HEADERS.some(
+      (kw) => firstField === kw || firstField.startsWith(kw),
+    );
+
+    // Step 3: Is the first token a date pattern or OHLCV header keyword?
+    const OHLCV_HEADERS = ["date", "open", "high", "low", "close", "volume"];
+    const looksLikeDate =
+      /\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(firstField) ||
+      /\d{1,2}[-/]\d{1,2}[-/]\d{2,4}/.test(firstField);
+    const isOHLCVKeyword = OHLCV_HEADERS.includes(firstField);
+    const isOHLCV = looksLikeDate || isOHLCVKeyword;
+
+    if (!isNumericFirst && isOHLCV) {
+      // Format B — OHLCV (Date, Open, High, Low, Close, Volume)
+      try {
+        const dataLines = isOHLCVKeyword ? lines.slice(1) : lines;
+        const bars = dataLines
+          .map((line) => {
+            const cols = splitCols(line);
+            if (cols.length < 5) return null;
+            return {
+              date: cols[0]?.trim() ?? "",
+              open: Number.parseFloat(cols[1] ?? "NaN"),
+              high: Number.parseFloat(cols[2] ?? "NaN"),
+              low: Number.parseFloat(cols[3] ?? "NaN"),
+              close: Number.parseFloat(cols[4] ?? "NaN"),
+              volume: Number.parseFloat(cols[5] ?? "0") || 0,
+            };
+          })
+          .filter(
+            (b): b is NonNullable<typeof b> =>
+              b !== null &&
+              !Number.isNaN(b.close) &&
+              b.close > 0 &&
+              !Number.isNaN(b.open) &&
+              !Number.isNaN(b.high) &&
+              !Number.isNaN(b.low),
+          )
+          .sort((a, b) => a.date.localeCompare(b.date));
+
+        if (bars.length < 30) {
+          setPasteError(
+            `Not enough data (${bars.length} bars). Need at least 30 trading days for OHLCV. If you have pre-computed indicators (Price, ROC21, RSI, MACD, MFI, Momentum), paste those directly — any number of rows works.`,
+          );
+          return;
+        }
+
+        const { calcAllIndicators } = await import("./lib/indicators");
+        const ind = calcAllIndicators(bars);
+        const parsed: DayData[] = bars
+          .slice(26)
+          .map((b, i) => {
+            const idx = i + 26;
+            return {
+              price: b.close,
+              roc21: ind.roc21[idx] ?? 0,
+              rsi: ind.rsi[idx] ?? 50,
+              macd: ind.macd[idx] ?? 0,
+              mfi: ind.mfi[idx] ?? 50,
+              momentum: ind.momentum[idx] ?? 0,
+              date: b.date,
+            };
+          })
+          .filter((d) => d.price > 0);
+
+        if (parsed.length === 0) {
+          setPasteError(
+            "Could not compute indicators. Try pasting more data (at least 30 rows).",
+          );
+          return;
+        }
+
+        resetAll(parsed);
+        setDataInputOpen(false);
+      } catch {
+        setPasteError("Could not parse OHLCV data. Check format.");
+      }
+    } else {
+      // Format A — pre-computed indicators: PRICE ROC21 RSI MACD MFI Momentum
+      // Skip the first line if it is a known header keyword (not a number)
+      const dataLines =
+        !isNumericFirst && isPrecomputedHeader ? lines.slice(1) : lines;
+
+      const parsed: DayData[] = dataLines
+        .map((line) => {
+          const cols = splitCols(line);
+          if (cols.length < 6) return null;
+          const price = Number.parseFloat(cols[0]);
+          const roc21 = Number.parseFloat(cols[1]);
+          const rsi = Number.parseFloat(cols[2]);
+          const macd = Number.parseFloat(cols[3]);
+          const mfi = Number.parseFloat(cols[4]);
+          const momentum = Number.parseFloat(cols[5]);
+          if (Number.isNaN(price) || price <= 0) return null;
+          return { price, roc21, rsi, macd, mfi, momentum } as DayData;
+        })
+        .filter((d): d is DayData => d !== null);
+
+      if (parsed.length > 0) {
+        resetAll(parsed);
+        setDataInputOpen(false);
+      } else {
+        setPasteError(
+          "Could not parse data. Expected 6 columns: Price, ROC21, RSI, MACD, MFI, Momentum — tab or space separated. Header row (PRICE DAY ROC21 ...) is optional.",
+        );
+      }
     }
   }
-
   function handleClear() {
     setRawInput("");
     resetAll(SAMPLE_DATA);
@@ -571,8 +715,6 @@ export default function App() {
   // Derived state
   const currentData = data[currentDay] ?? null;
   const prevData = currentDay >= 1 ? data[currentDay - 1] : null;
-  const prev2Data = currentDay >= 2 ? data[currentDay - 2] : null;
-  const prev3Data = currentDay >= 3 ? data[currentDay - 3] : null;
 
   const pnl =
     openTrade && currentData
@@ -745,9 +887,10 @@ export default function App() {
 
               {/* ── Manual Paste / Upload Section ── */}
               <div className="space-y-3">
-                <p className="text-xs text-muted-foreground">
-                  Paste tab-separated data: PRICE ROC21 RSI MACD MFI Momentum
-                  (one row per day)
+                <p className="text-xs text-muted-foreground whitespace-pre-line">
+                  {
+                    "Paste pre-computed indicator data (Price ROC21 RSI MACD MFI Momentum), tab or space separated. Header row is optional and will be auto-skipped."
+                  }
                 </p>
                 <textarea
                   data-ocid="data_input.textarea"
@@ -756,7 +899,7 @@ export default function App() {
                   rows={6}
                   className="w-full bg-input border border-border rounded px-3 py-2 text-xs font-mono text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-ring"
                   placeholder={
-                    "450.5\t3.2\t55.1\t0.8\t62.3\t4.5\n452.1\t3.5\t56.8\t1.1\t64.0\t5.2"
+                    "Pre-computed (tab or space separated, any number of rows):\n169.875   5.5   59.02   4.89   64.18   71.69\n167.6     -0.4  55.99   4.6    63.97   71.69\n\nWith optional header (will be auto-skipped):\nPRICE   DAY ROC21   DAY RSI   DAY MACD   DAY MFI   MOMENTUM SCORE\n169.875   5.5   59.02   4.89   64.18   71.69"
                   }
                 />
                 <div className="flex gap-2">
@@ -787,6 +930,14 @@ export default function App() {
                     />
                   </label>
                 </div>
+                {pasteError && (
+                  <div
+                    data-ocid="data_input.paste.error_state"
+                    className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2"
+                  >
+                    ⚠ {pasteError}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -867,11 +1018,11 @@ export default function App() {
             <ExitModulesTab
               currentData={currentData}
               prevData={prevData}
-              prev2Data={prev2Data}
-              prev3Data={prev3Data}
               inPosition={inPosition}
               coolingOffUntilDay={coolingOffUntilDay}
               currentDay={currentDay}
+              allData={data}
+              alphaPeak={alphaPeak}
             />
           )}
           {activeTab === "logs" && (

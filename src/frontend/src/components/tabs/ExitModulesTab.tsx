@@ -1,40 +1,44 @@
-import { useState } from "react";
 import type { DayData } from "../../lib/playback";
 import { ExitModuleCard } from "../ExitModuleCard";
+
+interface AlphaPeak {
+  idx: number;
+  price: number;
+  rsi: number;
+  macd: number;
+}
 
 interface ExitModulesTabProps {
   currentData: DayData | null;
   prevData: DayData | null;
-  prev2Data: DayData | null;
-  prev3Data: DayData | null;
   inPosition: boolean;
   coolingOffUntilDay: number | null;
   currentDay: number;
+  allData: DayData[];
+  alphaPeak: AlphaPeak | null;
 }
 
-type ModuleStatus = "MONITORING" | "ARMED" | "TRIGGERED";
-
-function getStatus(triggered: boolean, armed: boolean): ModuleStatus {
-  if (triggered) return "TRIGGERED";
-  if (armed) return "ARMED";
-  return "MONITORING";
+/**
+ * Compute rolling percentile over the last `window` values ending at the
+ * tail of `arr`. Returns null if fewer than 5 valid values are available.
+ */
+function rollingPct(arr: number[], window: number, pct: number): number | null {
+  if (arr.length < 5) return null;
+  const slice = arr.slice(-window).filter((v) => !Number.isNaN(v));
+  if (slice.length < 5) return null;
+  const s = [...slice].sort((a, b) => a - b);
+  return s[Math.floor(pct * (s.length - 1))];
 }
 
 export function ExitModulesTab({
   currentData: d,
   prevData: p,
-  prev2Data: p2,
-  prev3Data: p3,
   inPosition,
   coolingOffUntilDay,
   currentDay,
+  allData,
+  alphaPeak,
 }: ExitModulesTabProps) {
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({
-    "1": true,
-  });
-  const toggle = (key: string) =>
-    setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
-
   if (!d) {
     return (
       <div className="py-12 text-center text-muted-foreground text-sm">
@@ -43,190 +47,30 @@ export function ExitModulesTab({
     );
   }
 
-  // Hold check
-  const momDrop3 = p3 ? p3.momentum - d.momentum : 0;
-  const holdActive = d.rsi >= 48 && d.roc21 > -5 && momDrop3 <= 5;
+  // Compute dynamic thresholds from history up to current day
+  const rsiHistory = allData.slice(0, currentDay + 1).map((row) => row.rsi);
+  const mfiHistory = allData.slice(0, currentDay + 1).map((row) => row.mfi);
+  const T_RSI = rollingPct(rsiHistory, 50, 0.85);
+  const T_MFI = rollingPct(mfiHistory, 50, 0.85);
 
-  // Module 1: Profit-Take
-  const pt1 = d.roc21 > 15;
-  const pt2 = d.rsi > 75 || d.mfi > 80;
-  const ptTriggered = !holdActive && pt1 && pt2;
+  // Rule Alpha — momentum peak identification
+  const alphaFired =
+    (T_RSI !== null && d.rsi > T_RSI) || (T_MFI !== null && d.mfi > T_MFI);
+  const hasPeak = alphaPeak !== null;
 
-  // Module 2: Momentum Collapse
-  const mc1 = d.roc21 < 0;
-  const mc2 = !!(
-    p &&
-    p2 &&
-    d.momentum < p.momentum &&
-    p.momentum < p2.momentum
-  );
-  const mc3 = !!(p2 && p2.momentum - d.momentum > 8);
-  const mcTriggered = !holdActive && mc1 && mc2 && mc3;
+  // Rule Beta — ROC21 day-over-day deceleration
+  const betaFired = p !== null && d.roc21 < p.roc21;
 
-  // Module 3: RSI Divergence
-  const rd1 = d.rsi > 72;
-  const rd2 = !!(p && p2 && d.rsi < p.rsi && p.rsi < p2.rsi);
-  const rd3 = d.mfi < 50;
-  const rdTriggered = !holdActive && rd1 && rd2 && rd3;
+  // Rule Gamma — price/RSI/MACD divergence vs peak (only meaningful if peak exists and after it)
+  const gammaFired =
+    hasPeak &&
+    currentDay > alphaPeak!.idx &&
+    d.price >= alphaPeak!.price &&
+    d.rsi < alphaPeak!.rsi &&
+    d.macd < alphaPeak!.macd;
 
-  // Module 4: MACD+MFI
-  const mm1 = d.macd < 0;
-  const mm2 = d.mfi < 45;
-  const mm3 = !!(p && d.momentum < p.momentum);
-  const mmTriggered = !holdActive && mm1 && mm2 && mm3;
-
-  const modules = [
-    {
-      key: "1",
-      title: "1 · Profit-Take",
-      accent: "oklch(0.72 0.18 140)",
-      status: getStatus(ptTriggered && inPosition, pt1 || pt2),
-      conditions: [
-        {
-          label: "ROC21 > 15",
-          current: `${d.roc21.toFixed(2)}%`,
-          threshold: "> 15%",
-          met: pt1,
-        },
-        {
-          label: "RSI > 75",
-          current: d.rsi.toFixed(1),
-          threshold: "> 75",
-          met: d.rsi > 75,
-        },
-        {
-          label: "MFI > 80",
-          current: d.mfi.toFixed(1),
-          threshold: "> 80",
-          met: d.mfi > 80,
-        },
-      ],
-    },
-    {
-      key: "2",
-      title: "2 · Momentum Collapse",
-      accent: "oklch(0.65 0.22 25)",
-      status: getStatus(mcTriggered && inPosition, mc1),
-      conditions: [
-        {
-          label: "ROC21 < 0",
-          current: `${d.roc21.toFixed(2)}%`,
-          threshold: "< 0%",
-          met: mc1,
-        },
-        {
-          label: "3-day decline",
-          current: mc2 ? "Yes" : "No",
-          threshold: "Yes",
-          met: mc2,
-        },
-        {
-          label: "Drop > 8pts",
-          current: (p2 ? p2.momentum - d.momentum : 0).toFixed(2),
-          threshold: "> 8",
-          met: mc3,
-        },
-      ],
-    },
-    {
-      key: "3",
-      title: "3 · RSI Divergence",
-      accent: "oklch(0.78 0.18 75)",
-      status: getStatus(rdTriggered && inPosition, rd1),
-      conditions: [
-        {
-          label: "RSI > 72",
-          current: d.rsi.toFixed(1),
-          threshold: "> 72",
-          met: rd1,
-        },
-        {
-          label: "3-day RSI fall",
-          current: rd2 ? "Yes" : "No",
-          threshold: "Yes",
-          met: rd2,
-        },
-        {
-          label: "MFI < 50",
-          current: d.mfi.toFixed(1),
-          threshold: "< 50",
-          met: rd3,
-        },
-      ],
-    },
-    {
-      key: "4",
-      title: "4 · MACD+MFI",
-      accent: "oklch(0.65 0.15 265)",
-      status: getStatus(mmTriggered && inPosition, mm1 || mm2),
-      conditions: [
-        {
-          label: "MACD < 0",
-          current: d.macd.toFixed(3),
-          threshold: "< 0",
-          met: mm1,
-        },
-        {
-          label: "MFI < 45",
-          current: d.mfi.toFixed(1),
-          threshold: "< 45",
-          met: mm2,
-        },
-        {
-          label: "Momentum falling",
-          current: mm3 ? "Yes" : "No",
-          threshold: "Yes",
-          met: mm3,
-        },
-      ],
-    },
-    {
-      key: "5",
-      title: "5 · Multi-Weak",
-      accent: "oklch(0.72 0.15 195)",
-      status: getStatus(
-        !holdActive && d.roc21 < -3 && (d.rsi < 45 || d.mfi < 45) && inPosition,
-        d.roc21 < -1,
-      ),
-      conditions: [
-        {
-          label: "ROC21 < -3",
-          current: `${d.roc21.toFixed(2)}%`,
-          threshold: "< -3%",
-          met: d.roc21 < -3,
-        },
-        {
-          label: "RSI < 45",
-          current: d.rsi.toFixed(1),
-          threshold: "< 45",
-          met: d.rsi < 45,
-        },
-        {
-          label: "MFI < 45",
-          current: d.mfi.toFixed(1),
-          threshold: "< 45",
-          met: d.mfi < 45,
-        },
-      ],
-    },
-    {
-      key: "6",
-      title: "6 · Hard Floor",
-      accent: "oklch(0.65 0.22 25)",
-      status: getStatus(
-        !holdActive && d.roc21 < -9 && inPosition,
-        d.roc21 < -5,
-      ),
-      conditions: [
-        {
-          label: "ROC21 < -9",
-          current: `${d.roc21.toFixed(2)}%`,
-          threshold: "< -9%",
-          met: d.roc21 < -9,
-        },
-      ],
-    },
-  ];
+  // Final Execution
+  const finalFired = hasPeak && betaFired && gammaFired && inPosition;
 
   // Re-entry scanner state
   const isCooling =
@@ -247,41 +91,130 @@ export function ExitModulesTab({
 
   return (
     <div className="space-y-2">
-      {/* Hold status */}
+      {/* Rule Alpha card */}
+      <ExitModuleCard
+        title="Rule α · Momentum Peak Identification"
+        accent="oklch(0.72 0.20 55)"
+        status={alphaFired ? "TRIGGERED" : hasPeak ? "ARMED" : "MONITORING"}
+        conditions={[
+          {
+            label: "RSI > Dynamic Upper (85th pct)",
+            current: d.rsi.toFixed(1),
+            threshold: T_RSI !== null ? T_RSI.toFixed(1) : "calculating…",
+            met: T_RSI !== null && d.rsi > T_RSI,
+          },
+          {
+            label: "MFI > Dynamic Upper (85th pct)",
+            current: d.mfi.toFixed(1),
+            threshold: T_MFI !== null ? T_MFI.toFixed(1) : "calculating…",
+            met: T_MFI !== null && d.mfi > T_MFI,
+          },
+          {
+            label: "Peak Recorded",
+            current: hasPeak
+              ? `Day ${alphaPeak!.idx + 1} @ $${alphaPeak!.price.toFixed(2)}`
+              : "None",
+            threshold: "Required",
+            met: hasPeak,
+          },
+        ]}
+        expanded
+        onToggle={() => {}}
+      />
+
+      {/* Rule Beta card */}
+      <ExitModuleCard
+        title="Rule β · Breakdown Confirmation"
+        accent="oklch(0.65 0.22 25)"
+        status={
+          betaFired && hasPeak ? "TRIGGERED" : hasPeak ? "ARMED" : "MONITORING"
+        }
+        conditions={[
+          {
+            label: "ROC21 Decelerating",
+            current: `${d.roc21.toFixed(2)}%`,
+            threshold: `< ${p?.roc21.toFixed(2) ?? "prev"}%`,
+            met: betaFired,
+          },
+          {
+            label: "Peak Exists",
+            current: hasPeak ? "Yes" : "No",
+            threshold: "Required",
+            met: hasPeak,
+          },
+        ]}
+        expanded
+        onToggle={() => {}}
+      />
+
+      {/* Rule Gamma card */}
+      <ExitModuleCard
+        title="Rule γ · Divergence-Decay Quantification"
+        accent="oklch(0.65 0.15 265)"
+        status={gammaFired ? "TRIGGERED" : hasPeak ? "ARMED" : "MONITORING"}
+        conditions={[
+          {
+            label: "Price ≥ Peak Price",
+            current: `$${d.price.toFixed(2)}`,
+            threshold: hasPeak
+              ? `≥ $${alphaPeak!.price.toFixed(2)}`
+              : "Need peak",
+            met: hasPeak && d.price >= alphaPeak!.price,
+          },
+          {
+            label: "RSI < Peak RSI",
+            current: d.rsi.toFixed(1),
+            threshold: hasPeak ? `< ${alphaPeak!.rsi.toFixed(1)}` : "Need peak",
+            met: hasPeak && d.rsi < alphaPeak!.rsi,
+          },
+          {
+            label: "MACD < Peak MACD",
+            current: d.macd.toFixed(3),
+            threshold: hasPeak
+              ? `< ${alphaPeak!.macd.toFixed(3)}`
+              : "Need peak",
+            met: hasPeak && d.macd < alphaPeak!.macd,
+          },
+        ]}
+        expanded
+        onToggle={() => {}}
+      />
+
+      {/* Final Execution banner */}
       <div
-        className={`px-3 py-2 rounded border text-xs font-medium flex items-center gap-2 ${
-          holdActive
-            ? "bg-success/10 text-success border-success/30"
-            : "bg-muted/30 text-muted-foreground border-border"
+        className={`mt-2 rounded-lg border px-4 py-3 text-sm font-semibold flex items-center gap-3 ${
+          finalFired
+            ? "bg-destructive/15 border-destructive/50 text-destructive"
+            : hasPeak && betaFired && gammaFired
+              ? "bg-warning/15 border-warning/50 text-warning"
+              : "bg-muted/20 border-border text-muted-foreground"
         }`}
+        data-ocid="exit_modules.final_execution.panel"
       >
         <span
-          className={`w-2 h-2 rounded-full ${holdActive ? "bg-success" : "bg-muted-foreground"}`}
+          className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
+            finalFired
+              ? "bg-destructive animate-pulse"
+              : hasPeak
+                ? "bg-warning/60"
+                : "bg-muted-foreground/40"
+          }`}
         />
-        HOLD OVERRIDE:{" "}
-        {holdActive
-          ? "ACTIVE — exit evaluation skipped"
-          : "INACTIVE — exits evaluated"}
-        {d && (
-          <span className="ml-auto text-[10px] font-mono">
-            RSI {d.rsi.toFixed(1)} | ROC21 {d.roc21.toFixed(1)} | MomDrop{" "}
-            {momDrop3.toFixed(1)}
-          </span>
-        )}
+        <span>
+          FINAL EXECUTION:{" "}
+          {finalFired
+            ? "🚨 EXIT SIGNAL ACTIVE"
+            : hasPeak && betaFired && gammaFired
+              ? "⚠ CONDITIONS ALIGNED — MONITORING"
+              : hasPeak
+                ? "Monitoring for Beta+Gamma alignment"
+                : "Waiting for Alpha peak identification"}
+        </span>
+        <span className="ml-auto text-[10px] font-mono">
+          α:{hasPeak ? "✓" : "✗"} β:{betaFired ? "✓" : "✗"} γ:
+          {gammaFired ? "✓" : "✗"}
+        </span>
       </div>
-
-      {/* Module cards */}
-      {modules.map((m) => (
-        <ExitModuleCard
-          key={m.key}
-          title={m.title}
-          accent={m.accent}
-          status={m.status}
-          conditions={m.conditions}
-          expanded={!!expanded[m.key]}
-          onToggle={() => toggle(m.key)}
-        />
-      ))}
 
       {/* Re-entry Scanner — only shown when not in position */}
       {!inPosition && (

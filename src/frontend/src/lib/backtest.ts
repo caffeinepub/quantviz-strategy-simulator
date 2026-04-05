@@ -31,13 +31,33 @@ function isNum(arr: (number | null)[], i: number): boolean {
   return arr[i] !== null && !Number.isNaN(arr[i]);
 }
 
+/**
+ * Compute rolling percentile over a window ending at index i.
+ * Returns null if fewer than 5 valid values are available.
+ */
+function rollingPercentile(
+  arr: (number | null)[],
+  i: number,
+  windowSize: number,
+  pct: number,
+): number | null {
+  const slice: number[] = [];
+  for (let j = Math.max(0, i - windowSize + 1); j <= i; j++) {
+    if (arr[j] !== null && !Number.isNaN(arr[j])) slice.push(arr[j] as number);
+  }
+  if (slice.length < 2) return null;
+  slice.sort((a, b) => a - b);
+  const idx = Math.floor(pct * (slice.length - 1));
+  return slice[idx];
+}
+
 export function runBacktest(
   bars: Bar[],
   indicators: IndicatorData,
   startDate?: string,
   endDate?: string,
 ): BacktestResult {
-  const { rsi, roc21, mfi, macd, momentum } = indicators;
+  const { rsi, roc21, mfi, macd } = indicators;
 
   // Filter by date range
   let filteredBars = bars;
@@ -64,27 +84,24 @@ export function runBacktest(
   let maxDrawdown = 0;
   const dailyReturns: number[] = [];
 
+  // --- Divergence-Decay Exit Protocol state ---
+  let alphaPeakIdx: number | null = null;
+  let alphaPeakPrice: number | null = null;
+  let alphaPeakRSI: number | null = null;
+  let alphaPeakMACD: number | null = null;
+
   for (let fi = 0; fi < filteredBars.length; fi++) {
     const i = fi + offset;
     const bar = filteredBars[fi];
 
     if (!inPosition) {
       if (lastExitIdx === null) {
-        // First entry — original logic: RSI cross ≥ 52, roc21 > 2, momentum > 0
-        if (
-          i >= 1 &&
-          isNum(rsi, i) &&
-          isNum(rsi, i - 1) &&
-          isNum(roc21, i) &&
-          isNum(momentum, i)
-        ) {
-          const rsiCross = getNum(rsi, i) >= 52 && getNum(rsi, i - 1) < 52;
-          if (rsiCross && getNum(roc21, i) > 2 && getNum(momentum, i) > 0) {
-            inPosition = true;
-            entryPrice = bar.close;
-            entryDate = bar.date;
-            entryIdx = i;
-          }
+        // First entry — use first bar as auto-entry
+        if (fi === 0) {
+          inPosition = true;
+          entryPrice = bar.close;
+          entryDate = bar.date;
+          entryIdx = i;
         }
       } else {
         // Re-entry after a previous exit — apply cooling-off + 3-condition rules
@@ -102,6 +119,11 @@ export function runBacktest(
           entryPrice = bar.close;
           entryDate = bar.date;
           entryIdx = i;
+          // Reset alpha peak for the new trade
+          alphaPeakIdx = null;
+          alphaPeakPrice = null;
+          alphaPeakRSI = null;
+          alphaPeakMACD = null;
         }
       }
       equityCurve.push({
@@ -109,84 +131,56 @@ export function runBacktest(
         equity: Number.parseFloat(equity.toFixed(2)),
       });
     } else {
-      // Check HOLD condition first
-      const momentumDrop3 =
-        i >= 3 && isNum(momentum, i) && isNum(momentum, i - 3)
-          ? getNum(momentum, i - 3) - getNum(momentum, i)
-          : 0;
+      // --- Divergence-Decay Exit Protocol ---
 
-      const hold =
-        isNum(rsi, i) &&
-        getNum(rsi, i) >= 48 &&
-        isNum(roc21, i) &&
-        getNum(roc21, i) > -5 &&
-        momentumDrop3 <= 5;
+      // Dynamic thresholds: rolling 85th percentile over last 50 bars
+      const T_RSI_upper = rollingPercentile(rsi, i, 50, 0.85);
+      const T_MFI_upper = rollingPercentile(mfi, i, 50, 0.85);
+
+      // Rule Alpha — momentum peak identification
+      // Use dynamic rolling 85th-percentile threshold; fall back to fixed overbought levels
+      // (RSI > 70, MFI > 80) when insufficient history is available.
+      const effectiveRSIThreshold = T_RSI_upper ?? 70;
+      const effectiveMFIThreshold = T_MFI_upper ?? 80;
+      const ruleAlpha =
+        (isNum(rsi, i) && getNum(rsi, i) > effectiveRSIThreshold) ||
+        (isNum(mfi, i) && getNum(mfi, i) > effectiveMFIThreshold);
+
+      if (ruleAlpha) {
+        // Update (overwrite) peak state with the most recent overbought peak
+        alphaPeakIdx = i;
+        alphaPeakPrice = bar.close;
+        alphaPeakRSI = isNum(rsi, i) ? getNum(rsi, i) : null;
+        alphaPeakMACD = isNum(macd, i) ? getNum(macd, i) : null;
+      }
 
       let exitReason = "";
 
-      if (!hold) {
-        // Rule 1: Profit-Take
-        if (
-          isNum(roc21, i) &&
-          getNum(roc21, i) > 15 &&
-          isNum(rsi, i) &&
-          isNum(mfi, i) &&
-          (getNum(rsi, i) > 75 || getNum(mfi, i) > 80)
-        ) {
-          exitReason = "Profit-Take";
-        }
-        // Rule 2: Momentum Collapse
-        else if (
-          i >= 2 &&
-          isNum(roc21, i) &&
-          getNum(roc21, i) < 0 &&
-          isNum(momentum, i) &&
-          isNum(momentum, i - 1) &&
-          isNum(momentum, i - 2) &&
-          getNum(momentum, i) < getNum(momentum, i - 1) &&
-          getNum(momentum, i - 1) < getNum(momentum, i - 2) &&
-          getNum(momentum, i - 2) - getNum(momentum, i) > 8
-        ) {
-          exitReason = "Momentum Collapse";
-        }
-        // Rule 3: RSI Divergence
-        else if (
-          i >= 2 &&
-          isNum(rsi, i) &&
-          getNum(rsi, i) > 72 &&
-          getNum(rsi, i) < getNum(rsi, i - 1) &&
-          getNum(rsi, i - 1) < getNum(rsi, i - 2) &&
-          isNum(mfi, i) &&
-          getNum(mfi, i) < 50
-        ) {
-          exitReason = "RSI Divergence";
-        }
-        // Rule 4: MACD+MFI
-        else if (
+      if (
+        alphaPeakIdx !== null &&
+        alphaPeakPrice !== null &&
+        alphaPeakRSI !== null &&
+        alphaPeakMACD !== null &&
+        i > alphaPeakIdx
+      ) {
+        // Rule Beta — ROC21 day-over-day deceleration
+        const ruleBeta =
           i >= 1 &&
-          isNum(macd, i) &&
-          getNum(macd, i) < 0 &&
-          isNum(mfi, i) &&
-          getNum(mfi, i) < 45 &&
-          isNum(momentum, i) &&
-          isNum(momentum, i - 1) &&
-          getNum(momentum, i) < getNum(momentum, i - 1)
-        ) {
-          exitReason = "MACD+MFI Weak";
-        }
-        // Rule 5: Multi-Weak
-        else if (
           isNum(roc21, i) &&
-          getNum(roc21, i) < -3 &&
+          isNum(roc21, i - 1) &&
+          getNum(roc21, i) < getNum(roc21, i - 1);
+
+        // Rule Gamma — price/RSI/MACD divergence vs peak
+        const ruleGamma =
           isNum(rsi, i) &&
-          isNum(mfi, i) &&
-          (getNum(rsi, i) < 45 || getNum(mfi, i) < 45)
-        ) {
-          exitReason = "Multi-Weak";
-        }
-        // Rule 6: Hard Floor
-        else if (isNum(roc21, i) && getNum(roc21, i) < -9) {
-          exitReason = "Hard Floor";
+          isNum(macd, i) &&
+          bar.close >= alphaPeakPrice &&
+          getNum(rsi, i) < alphaPeakRSI &&
+          getNum(macd, i) < alphaPeakMACD;
+
+        // Final Execution — all three conditions simultaneously
+        if (ruleBeta && ruleGamma) {
+          exitReason = "Divergence-Decay Exit";
         }
       }
 
@@ -213,6 +207,12 @@ export function runBacktest(
         inPosition = false;
         entryPrice = 0;
         lastExitIdx = i;
+
+        // Clear alpha peak state after exit
+        alphaPeakIdx = null;
+        alphaPeakPrice = null;
+        alphaPeakRSI = null;
+        alphaPeakMACD = null;
       }
 
       equityCurve.push({
