@@ -8,4 +8,5 @@ export interface None {
 }
 export type Option<T> = Some<T> | None;
 export interface backendInterface {
+    fetchStockData: (symbol: string, startTs: bigint, endTs: bigint) => Promise<{ ok: string } | { err: string }>;
 }

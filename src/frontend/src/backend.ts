@@ -90,9 +90,13 @@ export class ExternalBlob {
     }
 }
 export interface backendInterface {
+    fetchStockData: (symbol: string, startTs: bigint, endTs: bigint) => Promise<{ ok: string } | { err: string }>;
 }
 export class Backend implements backendInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
+    async fetchStockData(symbol: string, startTs: bigint, endTs: bigint): Promise<{ ok: string } | { err: string }> {
+        return this.actor.fetchStockData(symbol, startTs, endTs);
+    }
 }
 export interface CreateActorOptions {
     agent?: Agent;

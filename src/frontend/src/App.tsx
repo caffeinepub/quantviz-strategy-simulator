@@ -1,4 +1,4 @@
-import { ChevronDown, X } from "lucide-react";
+import { ChevronDown, Loader2, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertPanel } from "./components/AlertPanel";
 import { Header } from "./components/Header";
@@ -9,6 +9,7 @@ import { ChartTab } from "./components/tabs/ChartTab";
 import { ExitModulesTab } from "./components/tabs/ExitModulesTab";
 import { LogsTab } from "./components/tabs/LogsTab";
 import { OverviewTab } from "./components/tabs/OverviewTab";
+import { useActor } from "./hooks/useActor";
 import type {
   AlertEntry,
   DayData,
@@ -27,7 +28,18 @@ type ActiveTab =
   | "alerts"
   | "trades";
 
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function yearAgoStr() {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 1);
+  return d.toISOString().slice(0, 10);
+}
+
 export default function App() {
+  const { actor } = useActor();
   const [data, setData] = useState<DayData[]>(SAMPLE_DATA);
   const [currentDay, setCurrentDay] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -62,6 +74,13 @@ export default function App() {
   const [coolingOffUntilDay, setCoolingOffUntilDay] = useState<number | null>(
     null,
   );
+
+  // Auto-fetch state
+  const [stockSymbol, setStockSymbol] = useState("");
+  const [fromDate, setFromDate] = useState(yearAgoStr);
+  const [toDate, setToDate] = useState(todayStr);
+  const [fetchLoading, setFetchLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Refs to avoid stale closures
   const inPositionRef = useRef(true);
@@ -222,7 +241,6 @@ export default function App() {
             message: `ROC21 ${d.roc21.toFixed(1)}% approaching Multi-Weak threshold (-3)`,
             level: "warning",
           });
-          // Trigger cooling-off if not already set
           if (coolingOffUntilDayRef.current === null) {
             const coolUntil = dayIdx + 3;
             setCoolingOffUntilDay(coolUntil);
@@ -235,7 +253,6 @@ export default function App() {
             message: `MACD ${d.macd.toFixed(2)} negative, MFI ${d.mfi.toFixed(1)} weakening`,
             level: "warning",
           });
-          // Trigger cooling-off if not already set
           if (coolingOffUntilDayRef.current === null) {
             const coolUntil = dayIdx + 3;
             setCoolingOffUntilDay(coolUntil);
@@ -246,7 +263,6 @@ export default function App() {
         // Not in position — handle re-entry logic
         if (coolingOffUntilDayRef.current !== null) {
           if (dayIdx < coolingOffUntilDayRef.current) {
-            // Still in cooling-off period
             const daysLeft = coolingOffUntilDayRef.current - dayIdx;
             addLog({
               day: dayIdx,
@@ -255,13 +271,11 @@ export default function App() {
               module: "reentry",
             });
           } else {
-            // Cooling-off complete — check re-entry conditions
             const roc21Met = d.roc21 > 0;
             const rsiMet = d.rsi > 50;
             const mfiMet = d.mfi > 45;
 
             if (roc21Met && rsiMet && mfiMet) {
-              // All 3 conditions met — re-enter at current market price
               const reEntryPrice = d.price;
               const newTrade: TradeRecord = {
                 entryDay: dayIdx,
@@ -277,7 +291,6 @@ export default function App() {
                 message: `ENTRY @ $${reEntryPrice.toFixed(2)} | Re-entry: ROC21/RSI/MFI conditions met`,
                 module: "entry",
               });
-              // Check MACD optional confirmation
               const macdPositive = d.macd > 0;
               const macdImproving = prev !== null && d.macd > prev.macd;
               if (macdPositive || macdImproving) {
@@ -289,11 +302,9 @@ export default function App() {
                   module: "reentry",
                 });
               }
-              // Clear cooling-off
               setCoolingOffUntilDay(null);
               coolingOffUntilDayRef.current = null;
             } else {
-              // Conditions not met — log daily scan status
               addLog({
                 day: dayIdx,
                 type: "info",
@@ -303,7 +314,6 @@ export default function App() {
             }
           }
         }
-        // If coolingOffUntilDayRef.current === null and not in position, that's the initial state before any exit — no action.
       }
     },
     [addLog, addAlert],
@@ -351,6 +361,117 @@ export default function App() {
     }
   }
 
+  async function handleAutoFetch() {
+    const sym = stockSymbol.trim().toUpperCase();
+    if (!sym) {
+      setFetchError(
+        "Please enter a stock symbol (e.g. RELIANCE, TCS, INFY, NATIONALUM)",
+      );
+      return;
+    }
+    if (!fromDate || !toDate) {
+      setFetchError("Please select both From and To dates");
+      return;
+    }
+    if (!actor) {
+      setFetchError("Backend not ready. Please wait a moment and try again.");
+      return;
+    }
+
+    setFetchLoading(true);
+    setFetchError(null);
+
+    try {
+      const startTs = Math.floor(new Date(fromDate).getTime() / 1000);
+      const endTs = Math.floor(new Date(toDate).getTime() / 1000);
+
+      // Call backend which fetches from Stooq (avoids CORS/403 issues)
+      const result = await actor.fetchStockData(
+        sym,
+        BigInt(startTs),
+        BigInt(endTs),
+      );
+
+      let csvText: string;
+      if ("err" in result) {
+        throw new Error(result.err);
+      }
+      csvText = result.ok;
+
+      // Parse Stooq CSV: Date,Open,High,Low,Close,Volume
+      const csvLines = csvText.trim().split("\n").filter(Boolean);
+      if (csvLines.length < 2) {
+        throw new Error(
+          "No data returned for this symbol. Check the symbol name (e.g. RELIANCE, NATIONALUM, TCS) and date range.",
+        );
+      }
+
+      // Skip header row
+      const rawBars = csvLines
+        .slice(1)
+        .map((line) => {
+          const cols = line.split(",");
+          return {
+            date: cols[0]?.trim() ?? "",
+            open: Number.parseFloat(cols[1] ?? "NaN"),
+            high: Number.parseFloat(cols[2] ?? "NaN"),
+            low: Number.parseFloat(cols[3] ?? "NaN"),
+            close: Number.parseFloat(cols[4] ?? "NaN"),
+            volume: Number.parseFloat(cols[5] ?? "0") || 0,
+          };
+        })
+        .filter(
+          (b) =>
+            b.date.length > 0 &&
+            !Number.isNaN(b.close) &&
+            b.close > 0 &&
+            !Number.isNaN(b.open) &&
+            !Number.isNaN(b.high) &&
+            !Number.isNaN(b.low),
+        )
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+      if (rawBars.length < 30) {
+        throw new Error(
+          `Not enough data (${rawBars.length} bars). Need at least 30 trading days. Try extending the date range or check the symbol.`,
+        );
+      }
+
+      const { calcAllIndicators } = await import("./lib/indicators");
+      const ind = calcAllIndicators(rawBars);
+      const parsed: DayData[] = rawBars
+        .slice(26)
+        .map((b, i) => {
+          const idx = i + 26;
+          return {
+            price: b.close,
+            roc21: ind.roc21[idx] ?? 0,
+            rsi: ind.rsi[idx] ?? 50,
+            macd: ind.macd[idx] ?? 0,
+            mfi: ind.mfi[idx] ?? 50,
+            momentum: ind.momentum[idx] ?? 0,
+            date: b.date,
+          };
+        })
+        .filter((d) => d.price > 0);
+
+      if (parsed.length === 0) {
+        throw new Error(
+          "Could not compute indicators. Try a longer date range.",
+        );
+      }
+
+      resetAll(parsed);
+      setDataInputOpen(false);
+    } catch (err: any) {
+      setFetchError(
+        err?.message ?? "Failed to fetch stock data. Please try again.",
+      );
+    } finally {
+      setFetchLoading(false);
+    }
+  }
+
   function handleLoadData() {
     const lines = rawInput.trim().split("\n").filter(Boolean);
     const parsed: DayData[] = lines
@@ -395,11 +516,9 @@ export default function App() {
 
       if (closeIdx === -1) return;
 
-      // Try to get indicators from CSV or compute from OHLCV
       const { generateTradingData } = { generateTradingData: null } as any;
       void generateTradingData;
 
-      // Build raw bars from CSV, compute indicators
       import("./lib/indicators").then(({ calcAllIndicators }) => {
         import("./lib/sampleData").then(() => {
           const bars = lines
@@ -516,48 +635,158 @@ export default function App() {
             />
           </button>
           {dataInputOpen && (
-            <div className="px-4 pb-4 space-y-3 border-t border-border pt-3">
-              <p className="text-xs text-muted-foreground">
-                Paste tab-separated data: PRICE ROC21 RSI MACD MFI Momentum (one
-                row per day)
-              </p>
-              <textarea
-                data-ocid="data_input.textarea"
-                value={rawInput}
-                onChange={(e) => setRawInput(e.target.value)}
-                rows={6}
-                className="w-full bg-input border border-border rounded px-3 py-2 text-xs font-mono text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-ring"
-                placeholder={
-                  "450.5\t3.2\t55.1\t0.8\t62.3\t4.5\n452.1\t3.5\t56.8\t1.1\t64.0\t5.2"
-                }
-              />
-              <div className="flex gap-2">
+            <div className="px-4 pb-4 space-y-4 border-t border-border pt-3">
+              {/* ── Auto-Fetch Section ── */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-primary uppercase tracking-wider">
+                    🔍 Auto-Fetch NSE Stock Data
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  India NSE stocks — enter symbol only (e.g.{" "}
+                  <span className="text-foreground font-medium">RELIANCE</span>,
+                  not RELIANCE.NS)
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <div className="flex flex-col gap-1">
+                    <label
+                      className="text-xs text-muted-foreground font-medium"
+                      htmlFor="stock-symbol"
+                    >
+                      Stock Symbol
+                    </label>
+                    <input
+                      id="stock-symbol"
+                      data-ocid="data_input.search_input"
+                      type="text"
+                      value={stockSymbol}
+                      onChange={(e) => setStockSymbol(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleAutoFetch();
+                      }}
+                      placeholder="e.g. RELIANCE, TCS, INFY, HDFC"
+                      className="bg-input border border-border rounded px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary placeholder:text-muted-foreground/50 uppercase"
+                      style={{ textTransform: "uppercase" }}
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label
+                      className="text-xs text-muted-foreground font-medium"
+                      htmlFor="from-date"
+                    >
+                      From Date
+                    </label>
+                    <input
+                      id="from-date"
+                      data-ocid="data_input.input"
+                      type="date"
+                      value={fromDate}
+                      onChange={(e) => setFromDate(e.target.value)}
+                      className="bg-input border border-border rounded px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label
+                      className="text-xs text-muted-foreground font-medium"
+                      htmlFor="to-date"
+                    >
+                      To Date
+                    </label>
+                    <input
+                      id="to-date"
+                      type="date"
+                      value={toDate}
+                      onChange={(e) => setToDate(e.target.value)}
+                      className="bg-input border border-border rounded px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                </div>
+
                 <button
                   type="button"
-                  data-ocid="data_input.load.primary_button"
-                  onClick={handleLoadData}
-                  className="bg-primary text-primary-foreground px-4 py-2 rounded text-sm font-medium hover:bg-primary/90 transition-colors"
+                  data-ocid="data_input.primary_button"
+                  onClick={handleAutoFetch}
+                  disabled={fetchLoading}
+                  className="flex items-center gap-2 bg-primary text-primary-foreground px-5 py-2 rounded text-sm font-semibold hover:bg-primary/90 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  Load & Run
+                  {fetchLoading ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin" />
+                      <span>Fetching...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>⚡</span>
+                      <span>Fetch &amp; Run</span>
+                    </>
+                  )}
                 </button>
-                <button
-                  type="button"
-                  data-ocid="data_input.clear.button"
-                  onClick={handleClear}
-                  className="bg-secondary text-secondary-foreground px-4 py-2 rounded text-sm hover:bg-secondary/80 transition-colors"
-                >
-                  Clear
-                </button>
-                <label className="bg-secondary text-secondary-foreground px-4 py-2 rounded text-sm cursor-pointer hover:bg-secondary/80 transition-colors">
-                  Upload CSV
-                  <input
-                    type="file"
-                    accept=".csv"
-                    data-ocid="data_input.upload_button"
-                    onChange={handleCSV}
-                    className="hidden"
-                  />
-                </label>
+
+                {fetchError && (
+                  <div
+                    data-ocid="data_input.error_state"
+                    className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded px-3 py-2"
+                  >
+                    ⚠ {fetchError}
+                  </div>
+                )}
+              </div>
+
+              {/* ── Divider ── */}
+              <div className="flex items-center gap-3">
+                <div className="flex-1 h-px bg-border" />
+                <span className="text-xs text-muted-foreground whitespace-nowrap">
+                  — or paste / upload manually —
+                </span>
+                <div className="flex-1 h-px bg-border" />
+              </div>
+
+              {/* ── Manual Paste / Upload Section ── */}
+              <div className="space-y-3">
+                <p className="text-xs text-muted-foreground">
+                  Paste tab-separated data: PRICE ROC21 RSI MACD MFI Momentum
+                  (one row per day)
+                </p>
+                <textarea
+                  data-ocid="data_input.textarea"
+                  value={rawInput}
+                  onChange={(e) => setRawInput(e.target.value)}
+                  rows={6}
+                  className="w-full bg-input border border-border rounded px-3 py-2 text-xs font-mono text-foreground resize-none focus:outline-none focus:ring-1 focus:ring-ring"
+                  placeholder={
+                    "450.5\t3.2\t55.1\t0.8\t62.3\t4.5\n452.1\t3.5\t56.8\t1.1\t64.0\t5.2"
+                  }
+                />
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    data-ocid="data_input.load.primary_button"
+                    onClick={handleLoadData}
+                    className="bg-primary text-primary-foreground px-4 py-2 rounded text-sm font-medium hover:bg-primary/90 transition-colors"
+                  >
+                    Load & Run
+                  </button>
+                  <button
+                    type="button"
+                    data-ocid="data_input.clear.button"
+                    onClick={handleClear}
+                    className="bg-secondary text-secondary-foreground px-4 py-2 rounded text-sm hover:bg-secondary/80 transition-colors"
+                  >
+                    Clear
+                  </button>
+                  <label className="bg-secondary text-secondary-foreground px-4 py-2 rounded text-sm cursor-pointer hover:bg-secondary/80 transition-colors">
+                    Upload CSV
+                    <input
+                      type="file"
+                      accept=".csv"
+                      data-ocid="data_input.upload_button"
+                      onChange={handleCSV}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
               </div>
             </div>
           )}
