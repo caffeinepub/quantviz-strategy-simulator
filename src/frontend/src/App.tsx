@@ -217,7 +217,8 @@ export default function App() {
           (T_RSI_upper !== null && d.rsi > T_RSI_upper) ||
           (T_MFI_upper !== null && d.mfi > T_MFI_upper);
 
-        if (ruleAlpha) {
+        // Record the FIRST peak only — never overwrite; the original peak is the divergence reference
+        if (ruleAlpha && alphaPeakRef.current === null) {
           alphaPeakRef.current = {
             idx: dayIdx,
             price: d.price,

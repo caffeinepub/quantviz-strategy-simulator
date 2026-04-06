@@ -153,8 +153,8 @@ export function runBacktest(
           getNum(rsi, i) > T_RSI_upper) ||
         (T_MFI_upper !== null && isNum(mfi, i) && getNum(mfi, i) > T_MFI_upper);
 
-      if (ruleAlpha) {
-        // Record the peak (overwrite with most recent if multiple peaks occur)
+      if (ruleAlpha && alphaPeakIdx === null) {
+        // Record the FIRST peak only — never overwrite; the original peak is the divergence reference
         alphaPeakIdx = i;
         alphaPeakPrice = bar.close;
         alphaPeakRSI = isNum(rsi, i) ? getNum(rsi, i) : null;
