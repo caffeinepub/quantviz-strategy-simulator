@@ -74,8 +74,10 @@ export default function App() {
   const [coolingOffUntilDay, setCoolingOffUntilDay] = useState<number | null>(
     null,
   );
-  const [alphaPeak, setAlphaPeak] = useState<{
-    idx: number;
+
+  // State machine React state (for display)
+  const [systemState, setSystemState] = useState<"AVOID" | "TRACKING">("AVOID");
+  const [stateMachinePeak, setStateMachinePeak] = useState<{
     price: number;
     rsi: number;
     macd: number;
@@ -99,12 +101,13 @@ export default function App() {
   const dataRef = useRef<DayData[]>(SAMPLE_DATA);
   const coolingOffUntilDayRef = useRef<number | null>(null);
   const lastExitPriceRef = useRef<number | null>(null);
-  const alphaPeakRef = useRef<{
-    idx: number;
-    price: number;
-    rsi: number;
-    macd: number;
-  } | null>(null);
+
+  // State machine refs
+  const systemStateRef = useRef<"AVOID" | "TRACKING">("AVOID");
+  const peakPriceRef = useRef(0.0);
+  const peakRsiRef = useRef(0.0);
+  const peakMacdRef = useRef(0.0);
+  const prevRoc21Ref = useRef(0.0);
 
   // Keep refs in sync
   useEffect(() => {
@@ -163,141 +166,178 @@ export default function App() {
     setAlertLog((prev) => [...prev, entry]);
   }, []);
 
+  // ── Strict State Machine evaluateDay ──────────────────────────────────────
+  //
+  // Architecture:
+  //   Step A: Calculate rolling thresholds (prior bars only, window=20, 85th pct)
+  //   Step B: Rule Zero — if AVOID, check if RSI > T_RSI_upper OR MFI > T_MFI_upper
+  //            → False: stay AVOID, log, go to Step F
+  //            → True:  transition to TRACKING via Step C
+  //   Step C: Rule Alpha — lock initial peak (on AVOID→TRACKING transition)
+  //            or update peak if still in upper zone and RSI pushing higher
+  //   Step D: Rule Beta  — cur_roc21 < prevRoc21Ref.current
+  //   Step E: Rule Gamma — price >= peak AND RSI < peak_rsi AND MACD < peak_macd
+  //            → EXIT + reset to AVOID
+  //   Step F: prevRoc21Ref.current = cur_roc21
+  // ─────────────────────────────────────────────────────────────────────────
   const evaluateDay = useCallback(
     (dayIdx: number) => {
       const arr = dataRef.current;
       const d = arr[dayIdx];
-      const prev = dayIdx >= 1 ? arr[dayIdx - 1] : null;
+      if (!d) return;
+
+      const WINDOW = 20;
+      const PCT = 0.85;
+
+      // Step A: rolling thresholds — prior bars only (0..dayIdx-1, excludes current)
+      const rollingPctFromArr = (
+        field: keyof typeof d,
+        upToIdx: number,
+        window: number,
+        pct: number,
+      ): number | null => {
+        if (upToIdx === 0) return null;
+        const slice: number[] = [];
+        for (let j = Math.max(0, upToIdx - window); j < upToIdx; j++) {
+          const v = arr[j]?.[field] as number;
+          if (v !== undefined && !Number.isNaN(v)) slice.push(v);
+        }
+        if (slice.length === 0) return null;
+        slice.sort((a, b) => a - b);
+        return slice[Math.floor(pct * (slice.length - 1))];
+      };
+
+      const T_RSI_upper = rollingPctFromArr("rsi", dayIdx, WINDOW, PCT);
+      const T_MFI_upper = rollingPctFromArr("mfi", dayIdx, WINDOW, PCT);
+
+      const cur_rsi = d.rsi;
+      const cur_mfi = d.mfi;
+      const cur_roc21 = d.roc21;
+      const cur_macd = d.macd;
+      const cur_price = d.price;
+
+      const rsiAbove = T_RSI_upper !== null && cur_rsi > T_RSI_upper;
+      const mfiAbove = T_MFI_upper !== null && cur_mfi > T_MFI_upper;
 
       if (inPositionRef.current) {
-        // --- Divergence-Decay Exit Protocol ---
-
-        // Dynamic thresholds: rolling 85th percentile over last 50 bars
-        // Returns null only when zero valid data points exist (slice.length === 0)
-        const rollingPctFromArr = (
-          field: keyof typeof d,
-          upToIdx: number,
-          window: number,
-          pct: number,
-        ): number | null => {
-          const slice: number[] = [];
-          for (let j = Math.max(0, upToIdx - window + 1); j <= upToIdx; j++) {
-            const v = arr[j]?.[field] as number;
-            if (v !== undefined && !Number.isNaN(v)) slice.push(v);
+        // ── Step B: Rule Zero (AVOID block) ──────────────────────────────────
+        if (systemStateRef.current === "AVOID") {
+          if (!rsiAbove && !mfiAbove) {
+            // Stay AVOID — momentum insufficient
+            addLog({
+              day: dayIdx,
+              type: "info",
+              message: `AVOID — RSI ${cur_rsi.toFixed(1)} ≤ ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${cur_mfi.toFixed(1)} ≤ ${T_MFI_upper?.toFixed(1) ?? "n/a"}`,
+              module: "avoid",
+            });
+            // Step F
+            prevRoc21Ref.current = cur_roc21;
+            return;
           }
-          if (slice.length === 0) return null;
-          slice.sort((a, b) => a - b);
-          return slice[Math.floor(pct * (slice.length - 1))];
-        };
 
-        const T_RSI_upper = rollingPctFromArr("rsi", dayIdx, 50, 0.85);
-        const T_MFI_upper = rollingPctFromArr("mfi", dayIdx, 50, 0.85);
-
-        // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
-        // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
-        const ruleZeroAvoid =
-          (T_RSI_upper === null || d.rsi <= T_RSI_upper) &&
-          (T_MFI_upper === null || d.mfi <= T_MFI_upper);
-
-        const prevHadPeak = alphaPeakRef.current !== null;
-
-        if (ruleZeroAvoid && !prevHadPeak) {
-          // AVOID state is active — log it
-          addLog({
-            day: dayIdx,
-            type: "info",
-            message: `AVOID — RSI ${d.rsi.toFixed(1)} ≤ ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} ≤ ${T_MFI_upper?.toFixed(1) ?? "n/a"} | Both below adaptive threshold`,
-            module: "avoid",
+          // ── Step C: AVOID→TRACKING transition — lock initial peak ─────────
+          peakPriceRef.current = cur_price;
+          peakRsiRef.current = cur_rsi;
+          peakMacdRef.current = cur_macd;
+          systemStateRef.current = "TRACKING";
+          setSystemState("TRACKING");
+          setStateMachinePeak({
+            price: cur_price,
+            rsi: cur_rsi,
+            macd: cur_macd,
           });
-        }
-
-        // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold (cancels AVOID)
-        // No fixed fallback: threshold is only unavailable when zero data exists
-        const ruleAlpha =
-          (T_RSI_upper !== null && d.rsi > T_RSI_upper) ||
-          (T_MFI_upper !== null && d.mfi > T_MFI_upper);
-
-        // Record the FIRST peak only — never overwrite; the original peak is the divergence reference
-        if (ruleAlpha && alphaPeakRef.current === null) {
-          alphaPeakRef.current = {
-            idx: dayIdx,
-            price: d.price,
-            rsi: d.rsi,
-            macd: d.macd,
-          };
-          setAlphaPeak(alphaPeakRef.current);
           addAlert({
             day: dayIdx,
-            message: `AVOID CLEARED — Momentum peak identified: RSI ${d.rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${d.mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"} | System enters TRACKING state`,
+            message: `AVOID CLEARED — Momentum peak identified: RSI ${cur_rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${cur_mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"}`,
             level: "warning",
           });
           addLog({
             day: dayIdx,
             type: "info",
-            message: `TRACKING — Rule Alpha fired, AVOID cleared. Peak @ $${d.price.toFixed(2)} | RSI ${d.rsi.toFixed(1)} | MFI ${d.mfi.toFixed(1)}`,
+            message: `TRACKING — Peak @ $${cur_price.toFixed(2)} | RSI ${cur_rsi.toFixed(1)} | MFI ${cur_mfi.toFixed(1)}`,
             module: "alpha",
           });
+          // No exit possible on the day we transition to TRACKING
+          // Step F
+          prevRoc21Ref.current = cur_roc21;
+          return;
         }
 
-        let exitReason = "";
+        // ── system_state === "TRACKING" ───────────────────────────────────────
 
-        if (
-          alphaPeakRef.current !== null &&
-          dayIdx > alphaPeakRef.current.idx
-        ) {
-          const peak = alphaPeakRef.current;
-
-          // Rule Beta — ROC21 day-over-day deceleration
-          const ruleBeta = prev !== null && d.roc21 < prev.roc21;
-
-          // Rule Gamma — price/RSI/MACD divergence vs peak
-          const ruleGamma =
-            d.price >= peak.price && d.rsi < peak.rsi && d.macd < peak.macd;
-
-          // Final Execution — all three conditions simultaneously
-          if (ruleBeta && ruleGamma) {
-            exitReason = "Divergence-Decay Exit";
+        // Step C continued: Update peak if still in upper zone and RSI pushing higher
+        if (rsiAbove || mfiAbove) {
+          if (cur_rsi > peakRsiRef.current) {
+            peakPriceRef.current = cur_price;
+            peakRsiRef.current = cur_rsi;
+            peakMacdRef.current = cur_macd;
+            setStateMachinePeak({
+              price: cur_price,
+              rsi: cur_rsi,
+              macd: cur_macd,
+            });
+            addLog({
+              day: dayIdx,
+              type: "info",
+              message: `TRACKING — Peak updated @ $${cur_price.toFixed(2)} | RSI ${cur_rsi.toFixed(1)}`,
+              module: "alpha",
+            });
           }
         }
 
-        if (exitReason && openTradeRef.current) {
-          const entryPrice = openTradeRef.current.entryPrice;
-          const pnlPct = ((d.price - entryPrice) / entryPrice) * 100;
-          const completed: TradeRecord = {
-            ...openTradeRef.current,
-            exitDay: dayIdx,
-            exitPrice: d.price,
-            exitReason,
-            pnlPct,
-          };
-          setCompletedTrades((prev) => [...prev, completed]);
-          setOpenTrade(null);
-          setInPosition(false);
-          setExitBanner(exitReason);
-          addLog({
-            day: dayIdx,
-            type: "exit",
-            message: `EXIT [${exitReason}] @ $${d.price.toFixed(2)} | P&L ${pnlPct.toFixed(2)}%`,
-            module: exitReason,
-          });
-          addAlert({
-            day: dayIdx,
-            message:
-              "DIVERGENCE-DECAY EXIT triggered — Beta+Gamma alignment confirmed",
-            level: "critical",
-          });
-          // Store exit price for use as re-entry price
-          lastExitPriceRef.current = d.price;
-          // Start cooling-off period: wait 3 days before scanning for re-entry
-          const coolUntil = dayIdx + 3;
-          setCoolingOffUntilDay(coolUntil);
-          coolingOffUntilDayRef.current = coolUntil;
-          // Clear alpha peak state after exit
-          alphaPeakRef.current = null;
-          setAlphaPeak(null);
+        // ── Step D: Rule Beta ─────────────────────────────────────────────────
+        const ruleBeta = cur_roc21 < prevRoc21Ref.current;
+
+        if (ruleBeta) {
+          // ── Step E: Rule Gamma ───────────────────────────────────────────────
+          const ruleGamma =
+            cur_price >= peakPriceRef.current &&
+            cur_rsi < peakRsiRef.current &&
+            cur_macd < peakMacdRef.current;
+
+          if (ruleGamma && openTradeRef.current) {
+            const entryPrice = openTradeRef.current.entryPrice;
+            const pnlPct = ((cur_price - entryPrice) / entryPrice) * 100;
+            const completed: TradeRecord = {
+              ...openTradeRef.current,
+              exitDay: dayIdx,
+              exitPrice: cur_price,
+              exitReason: "Divergence-Decay Exit",
+              pnlPct,
+            };
+            setCompletedTrades((prev) => [...prev, completed]);
+            setOpenTrade(null);
+            openTradeRef.current = null;
+            setInPosition(false);
+            inPositionRef.current = false;
+            setExitBanner("Divergence-Decay Exit");
+            addLog({
+              day: dayIdx,
+              type: "exit",
+              message: `EXIT [Divergence-Decay Exit] @ $${cur_price.toFixed(2)} | P&L ${pnlPct.toFixed(2)}%`,
+              module: "exit",
+            });
+            addAlert({
+              day: dayIdx,
+              message:
+                "DIVERGENCE-DECAY EXIT triggered — Beta+Gamma alignment confirmed",
+              level: "critical",
+            });
+            lastExitPriceRef.current = cur_price;
+            const coolUntil = dayIdx + 3;
+            setCoolingOffUntilDay(coolUntil);
+            coolingOffUntilDayRef.current = coolUntil;
+            // Reset state machine
+            systemStateRef.current = "AVOID";
+            peakPriceRef.current = 0.0;
+            peakRsiRef.current = 0.0;
+            peakMacdRef.current = 0.0;
+            setSystemState("AVOID");
+            setStateMachinePeak(null);
+          }
         }
       } else {
-        // Not in position — handle re-entry logic
+        // Not in position — re-entry logic
         if (coolingOffUntilDayRef.current !== null) {
           if (dayIdx < coolingOffUntilDayRef.current) {
             const daysLeft = coolingOffUntilDayRef.current - dayIdx;
@@ -308,34 +348,41 @@ export default function App() {
               module: "reentry",
             });
           } else {
-            const roc21Met = d.roc21 > 0;
-            const rsiMet = d.rsi > 50;
-            const mfiMet = d.mfi > 45;
+            const prev = dayIdx >= 1 ? arr[dayIdx - 1] : null;
+            const roc21Met = cur_roc21 > 0;
+            const rsiMet = cur_rsi > 50;
+            const mfiMet = cur_mfi > 45;
 
             if (roc21Met && rsiMet && mfiMet) {
-              const reEntryPrice = d.price;
               const newTrade: TradeRecord = {
                 entryDay: dayIdx,
-                entryPrice: reEntryPrice,
+                entryPrice: cur_price,
               };
               setInPosition(true);
               inPositionRef.current = true;
               setOpenTrade(newTrade);
               openTradeRef.current = newTrade;
+              // Reset state machine for new trade
+              systemStateRef.current = "AVOID";
+              peakPriceRef.current = 0.0;
+              peakRsiRef.current = 0.0;
+              peakMacdRef.current = 0.0;
+              prevRoc21Ref.current = 0.0;
+              setSystemState("AVOID");
+              setStateMachinePeak(null);
               addLog({
                 day: dayIdx,
                 type: "entry",
-                message: `ENTRY @ $${reEntryPrice.toFixed(2)} | Re-entry: ROC21/RSI/MFI conditions met`,
+                message: `ENTRY @ $${cur_price.toFixed(2)} | Re-entry: ROC21/RSI/MFI conditions met`,
                 module: "entry",
               });
-              const macdPositive = d.macd > 0;
-              const macdImproving = prev !== null && d.macd > prev.macd;
+              const macdPositive = cur_macd > 0;
+              const macdImproving = prev !== null && cur_macd > prev.macd;
               if (macdPositive || macdImproving) {
-                const detail = macdPositive ? "positive" : "improving";
                 addLog({
                   day: dayIdx,
                   type: "info",
-                  message: `MACD confirmation: ${detail} — high-confidence re-entry`,
+                  message: `MACD confirmation: ${macdPositive ? "positive" : "improving"} — high-confidence re-entry`,
                   module: "reentry",
                 });
               }
@@ -345,13 +392,16 @@ export default function App() {
               addLog({
                 day: dayIdx,
                 type: "info",
-                message: `RE-ENTRY SCAN: ROC21 ${d.roc21.toFixed(1)} (need>0) | RSI ${d.rsi.toFixed(1)} (need>50) | MFI ${d.mfi.toFixed(1)} (need>45) — conditions not met`,
+                message: `RE-ENTRY SCAN: ROC21 ${cur_roc21.toFixed(1)} (need>0) | RSI ${cur_rsi.toFixed(1)} (need>50) | MFI ${cur_mfi.toFixed(1)} (need>45) — conditions not met`,
                 module: "reentry",
               });
             }
           }
         }
       }
+
+      // Step F: update prev_roc21
+      prevRoc21Ref.current = cur_roc21;
     },
     [addLog, addAlert],
   );
@@ -374,8 +424,14 @@ export default function App() {
     setCoolingOffUntilDay(null);
     coolingOffUntilDayRef.current = null;
     lastExitPriceRef.current = null;
-    alphaPeakRef.current = null;
-    setAlphaPeak(null);
+    // Reset state machine
+    systemStateRef.current = "AVOID";
+    peakPriceRef.current = 0.0;
+    peakRsiRef.current = 0.0;
+    peakMacdRef.current = 0.0;
+    prevRoc21Ref.current = 0.0;
+    setSystemState("AVOID");
+    setStateMachinePeak(null);
 
     if (d.length > 0) {
       const autoTrade: TradeRecord = { entryDay: 0, entryPrice: d[0].price };
@@ -933,7 +989,7 @@ export default function App() {
                     onClick={handleLoadData}
                     className="bg-primary text-primary-foreground px-4 py-2 rounded text-sm font-medium hover:bg-primary/90 transition-colors"
                   >
-                    Load & Run
+                    Load &amp; Run
                   </button>
                   <button
                     type="button"
@@ -1046,7 +1102,8 @@ export default function App() {
               coolingOffUntilDay={coolingOffUntilDay}
               currentDay={currentDay}
               allData={data}
-              alphaPeak={alphaPeak}
+              systemState={systemState}
+              stateMachinePeak={stateMachinePeak}
             />
           )}
           {activeTab === "logs" && (

@@ -1,13 +1,6 @@
 import type { DayData } from "../../lib/playback";
 import { ExitModuleCard } from "../ExitModuleCard";
 
-interface AlphaPeak {
-  idx: number;
-  price: number;
-  rsi: number;
-  macd: number;
-}
-
 interface ExitModulesTabProps {
   currentData: DayData | null;
   prevData: DayData | null;
@@ -15,7 +8,8 @@ interface ExitModulesTabProps {
   coolingOffUntilDay: number | null;
   currentDay: number;
   allData: DayData[];
-  alphaPeak: AlphaPeak | null;
+  systemState: "AVOID" | "TRACKING";
+  stateMachinePeak: { price: number; rsi: number; macd: number } | null;
 }
 
 /**
@@ -23,6 +17,8 @@ interface ExitModulesTabProps {
  * tail of `arr`. Returns null only when zero valid values are available.
  * No minimum row requirement — works with any dataset size.
  */
+// Threshold computed from PRIOR bars only (exclude current day's value).
+// allData is sliced up to currentDay (exclusive), so the current bar is not included.
 function rollingPct(arr: number[], window: number, pct: number): number | null {
   const slice = arr.slice(-window).filter((v) => !Number.isNaN(v));
   if (slice.length === 0) return null;
@@ -37,7 +33,8 @@ export function ExitModulesTab({
   coolingOffUntilDay,
   currentDay,
   allData,
-  alphaPeak,
+  systemState,
+  stateMachinePeak,
 }: ExitModulesTabProps) {
   if (!d) {
     return (
@@ -47,42 +44,42 @@ export function ExitModulesTab({
     );
   }
 
-  // Compute dynamic thresholds from history up to current day
-  const rsiHistory = allData.slice(0, currentDay + 1).map((row) => row.rsi);
-  const mfiHistory = allData.slice(0, currentDay + 1).map((row) => row.mfi);
-  const T_RSI = rollingPct(rsiHistory, 50, 0.85);
-  const T_MFI = rollingPct(mfiHistory, 50, 0.85);
+  // Compute dynamic thresholds from PRIOR bars only (0..currentDay-1).
+  // The current bar is excluded so Rule Alpha can breach the threshold.
+  const rsiHistory = allData.slice(0, currentDay).map((row) => row.rsi);
+  const mfiHistory = allData.slice(0, currentDay).map((row) => row.mfi);
+  const T_RSI = rollingPct(rsiHistory, 20, 0.85);
+  const T_MFI = rollingPct(mfiHistory, 20, 0.85);
 
-  // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
-  // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
+  // Rule Zero display: AVOID when both RSI and MFI are at/below their adaptive upper thresholds
   const ruleZeroAvoid =
     (T_RSI === null || d.rsi <= T_RSI) && (T_MFI === null || d.mfi <= T_MFI);
 
-  // Rule Alpha — RSI OR MFI breaches adaptive upper threshold (cancels AVOID)
-  // I_alpha(t) = RSI(t) > T_RSI_upper(t) OR MFI(t) > T_MFI_upper(t)
+  // Rule Alpha display — RSI OR MFI breaches adaptive upper threshold
   const alphaFired =
     (T_RSI !== null && d.rsi > T_RSI) || (T_MFI !== null && d.mfi > T_MFI);
-  const hasPeak = alphaPeak !== null;
+
+  // hasPeak — derived from stateMachinePeak prop (set by state machine)
+  const hasPeak = stateMachinePeak !== null;
 
   // Rule Beta — ROC21(t) < ROC21(t-1)
+  // Uses prevData to match the state machine's prevRoc21Ref behaviour
   const betaFired = p !== null && d.roc21 < p.roc21;
 
   // Rule Gamma — price >= peak price AND RSI < peak RSI AND MACD < peak MACD
   const gammaFired =
     hasPeak &&
-    currentDay > alphaPeak!.idx &&
-    d.price >= alphaPeak!.price &&
-    d.rsi < alphaPeak!.rsi &&
-    d.macd < alphaPeak!.macd;
+    d.price >= stateMachinePeak!.price &&
+    d.rsi < stateMachinePeak!.rsi &&
+    d.macd < stateMachinePeak!.macd;
 
   // Final Execution — Alpha peak established + Beta + Gamma all align
   const finalFired = hasPeak && betaFired && gammaFired && inPosition;
 
-  // Algorithm state machine:
-  // EXIT > TRACKING > AVOID (priority order)
+  // Algorithm state — driven by systemState prop from state machine
   const algoState: "AVOID" | "TRACKING" | "EXIT" = finalFired
     ? "EXIT"
-    : hasPeak
+    : systemState === "TRACKING"
       ? "TRACKING"
       : "AVOID";
 
@@ -147,14 +144,14 @@ export function ExitModulesTab({
         status={ruleZeroAvoid ? "ACTIVE" : "CLEARED"}
         conditions={[
           {
-            label: "RSI ≤ Dynamic Upper (85th pct, rolling 50)",
+            label: "RSI ≤ Dynamic Upper (85th pct, rolling 20)",
             current: d.rsi.toFixed(1),
             threshold:
               T_RSI !== null ? `≤ ${T_RSI.toFixed(1)}` : "computing...",
             met: T_RSI === null || d.rsi <= T_RSI,
           },
           {
-            label: "MFI ≤ Dynamic Upper (85th pct, rolling 50)",
+            label: "MFI ≤ Dynamic Upper (85th pct, rolling 20)",
             current: d.mfi.toFixed(1),
             threshold:
               T_MFI !== null ? `≤ ${T_MFI.toFixed(1)}` : "computing...",
@@ -180,13 +177,13 @@ export function ExitModulesTab({
         status={alphaFired ? "TRIGGERED" : hasPeak ? "ARMED" : "MONITORING"}
         conditions={[
           {
-            label: "RSI > Dynamic Upper (85th pct, rolling 50)",
+            label: "RSI > Dynamic Upper (85th pct, rolling 20)",
             current: d.rsi.toFixed(1),
             threshold: T_RSI !== null ? T_RSI.toFixed(1) : "no data",
             met: T_RSI !== null && d.rsi > T_RSI,
           },
           {
-            label: "MFI > Dynamic Upper (85th pct, rolling 50)",
+            label: "MFI > Dynamic Upper (85th pct, rolling 20)",
             current: d.mfi.toFixed(1),
             threshold: T_MFI !== null ? T_MFI.toFixed(1) : "no data",
             met: T_MFI !== null && d.mfi > T_MFI,
@@ -194,7 +191,7 @@ export function ExitModulesTab({
           {
             label: "Peak Recorded",
             current: hasPeak
-              ? `Day ${alphaPeak!.idx + 1} @ $${alphaPeak!.price.toFixed(2)}`
+              ? `$${stateMachinePeak!.price.toFixed(2)} (RSI ${stateMachinePeak!.rsi.toFixed(1)})`
               : "None",
             threshold: "Required",
             met: hasPeak,
@@ -239,23 +236,25 @@ export function ExitModulesTab({
             label: "Price ≥ Peak Price",
             current: `$${d.price.toFixed(2)}`,
             threshold: hasPeak
-              ? `≥ $${alphaPeak!.price.toFixed(2)}`
+              ? `≥ $${stateMachinePeak!.price.toFixed(2)}`
               : "Need peak",
-            met: hasPeak && d.price >= alphaPeak!.price,
+            met: hasPeak && d.price >= stateMachinePeak!.price,
           },
           {
             label: "RSI < Peak RSI",
             current: d.rsi.toFixed(1),
-            threshold: hasPeak ? `< ${alphaPeak!.rsi.toFixed(1)}` : "Need peak",
-            met: hasPeak && d.rsi < alphaPeak!.rsi,
+            threshold: hasPeak
+              ? `< ${stateMachinePeak!.rsi.toFixed(1)}`
+              : "Need peak",
+            met: hasPeak && d.rsi < stateMachinePeak!.rsi,
           },
           {
             label: "MACD < Peak MACD",
             current: d.macd.toFixed(3),
             threshold: hasPeak
-              ? `< ${alphaPeak!.macd.toFixed(3)}`
+              ? `< ${stateMachinePeak!.macd.toFixed(3)}`
               : "Need peak",
-            met: hasPeak && d.macd < alphaPeak!.macd,
+            met: hasPeak && d.macd < stateMachinePeak!.macd,
           },
         ]}
         expanded

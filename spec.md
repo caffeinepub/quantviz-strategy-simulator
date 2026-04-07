@@ -1,34 +1,39 @@
 # QuantViz Strategy Simulator
 
 ## Current State
-The Divergence-Decay Exit Protocol is implemented with three rules (Alpha, Beta, Gamma) plus Final Execution. The algorithm starts in a position (auto-entry at first bar), monitors for Rule Alpha to fire (RSI or MFI breaches rolling 85th percentile), then watches for Beta + Gamma to align for the exit. There is no active AVOID signal — the system is simply silent until Alpha fires.
+
+The app has a Divergence-Decay Exit Protocol implemented but NOT as a proper state machine. The current code:
+- Uses a ref (`alphaPeakRef`) to track peak, no explicit `system_state` variable
+- Rule Alpha only fires once (first peak locked), but does NOT allow the peak to be updated if RSI/MFI push higher WITHIN the TRACKING state
+- Rule Beta uses `prev` (the prior DayData row) for ROC21 comparison, which works but is not an explicit `prev_roc21` memory variable
+- AVOID state is computed ad-hoc rather than as a persistent machine state
+- The backtest.ts loop has similar issues
+- Entry is always auto-taken on day 0 regardless of Rule Zero
 
 ## Requested Changes (Diff)
 
 ### Add
-- **Rule Zero (Capital Preservation / AVOID signal):** A new preliminary rule added before Rule Alpha.
-  - Condition: `I_avoid(t) = 1 iff RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)`
-  - While Rule Zero is active (both RSI and MFI are at or below their rolling adaptive upper thresholds), the algorithm outputs a continuous AVOID signal.
-  - Rule Zero is mutually exclusive with Rule Alpha: when Alpha fires, AVOID is lifted.
-- **Algorithm state machine** with three explicit states:
-  1. `AVOID` — Rule Zero is active (neither RSI nor MFI has breached threshold)
-  2. `TRACKING` — Rule Alpha has fired at least once; system is monitoring for Beta+Gamma
-  3. `EXIT` — Rule Alpha previously fired AND Beta+Gamma both true on the same day
-- **AVOID banner** in ExitModulesTab: a prominent yellow/amber panel shown when state is AVOID
-- **TRACKING banner** shown when state is TRACKING (Alpha has fired)
-- Rule Zero card displayed as the first card in ExitModulesTab
+- Explicit `system_state: "AVOID" | "TRACKING"` variable in both `backtest.ts` and `App.tsx`
+- `prev_roc21` memory variable updated at end of each day
+- `peak_price`, `peak_rsi`, `peak_macd` memory variables
+- Step B logic: when in AVOID, check if RSI > T_RSI_upper OR MFI > T_MFI_upper before any other rules
+- Step C logic: when entering TRACKING (or already TRACKING), UPDATE peak if current RSI or MFI is pushing higher (i.e., current RSI > peak_rsi OR current MFI is better)
+- Rule Zero blocks initial auto-entry: first entry only happens once Rule Alpha fires (system_state transitions to TRACKING)
 
 ### Modify
-- `backtest.ts`: Add Rule Zero computation alongside existing Alpha/Beta/Gamma. The backtest result should include the algorithm state per bar (avoid/tracking/exit) so the execution log can reflect it.
-- `App.tsx` (`evaluateDay`): Add Rule Zero check. When state is AVOID, log the AVOID status. When transitioning from AVOID → TRACKING (Alpha fires), log the state change. The existing Alpha/Beta/Gamma/Exit logic is unchanged.
-- `ExitModulesTab.tsx`: Add a Rule Zero card at the top. Update the algorithm state banner to show AVOID / TRACKING / EXIT as distinct states instead of just the Final Execution banner.
-- Alerts: add alert when AVOID state is entered or persists.
+- `runBacktest` in `backtest.ts`: full rewrite as sequential state machine loop following steps A→F
+- `evaluateDay` in `App.tsx`: full rewrite as sequential state machine following steps A→F
+- `ExitModulesTab`: display `system_state` (AVOID/TRACKING/EXIT) driven by the prop, not recomputed
+- Rolling threshold window changed from 50-bar to 20-bar per user spec ("last 20 days")
 
 ### Remove
-- Nothing removed — all existing logic is preserved. Rule Zero is additive.
+- All ad-hoc `alphaPeakRef === null` first-peak locking logic
+- The `void (...)` AVOID computation in backtest.ts that does nothing
 
 ## Implementation Plan
-1. Update `App.tsx` `evaluateDay`: compute Rule Zero (same dynamic thresholds as Alpha), add AVOID state to `useState`, log AVOID when both RSI and MFI are below thresholds, lift AVOID when Alpha fires.
-2. Update `ExitModulesTab.tsx`: add Rule Zero card at top showing AVOID state with current vs threshold values. Update the bottom banner to show three states: AVOID (amber), TRACKING (blue/cyan), EXIT (red).
-3. Update `backtest.ts`: compute Rule Zero per bar and annotate execution in the result.
-4. The algorithm output matrix is now: AVOID → TRACKING → EXIT, strictly per the user's spec.
+
+1. Rewrite `backtest.ts` `runBacktest` as a strict state machine with `system_state`, `peak_price/rsi/macd`, `prev_roc21` variables following Steps A-F exactly
+2. Rewrite `evaluateDay` in `App.tsx` as a strict state machine with the same variables stored in refs
+3. Add `systemState` ref + state (`"AVOID" | "TRACKING"`) to App.tsx, pass to ExitModulesTab
+4. Update `ExitModulesTab` to accept and display `systemState` prop instead of recomputing it
+5. Validate and deploy

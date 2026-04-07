@@ -32,9 +32,9 @@ function isNum(arr: (number | null)[], i: number): boolean {
 }
 
 /**
- * Compute rolling percentile over a window ending at index i.
- * Uses all available valid values in the window — no minimum row requirement.
- * Returns null only if there are zero valid values.
+ * Compute rolling percentile over PRIOR bars only (bars 0..i-1).
+ * Uses a lookback window of `windowSize` days.
+ * Returns null only when there are zero prior data points.
  */
 function rollingPercentile(
   arr: (number | null)[],
@@ -42,8 +42,9 @@ function rollingPercentile(
   windowSize: number,
   pct: number,
 ): number | null {
+  if (i === 0) return null; // no prior data
   const slice: number[] = [];
-  for (let j = Math.max(0, i - windowSize + 1); j <= i; j++) {
+  for (let j = Math.max(0, i - windowSize); j < i; j++) {
     if (arr[j] !== null && !Number.isNaN(arr[j])) slice.push(arr[j] as number);
   }
   if (slice.length === 0) return null;
@@ -85,149 +86,229 @@ export function runBacktest(
   let maxDrawdown = 0;
   const dailyReturns: number[] = [];
 
-  // --- Divergence-Decay Exit Protocol state ---
-  let alphaPeakIdx: number | null = null;
-  let alphaPeakPrice: number | null = null;
-  let alphaPeakRSI: number | null = null;
-  let alphaPeakMACD: number | null = null;
+  // ── State Machine Memory (Step 1: Initialize) ──────────────────────────────
+  // Thresholds use a 20-day rolling window (localized std/mean per user spec)
+  const THRESHOLD_WINDOW = 20;
+  const THRESHOLD_PCT = 0.85;
+
+  type SystemState = "AVOID" | "TRACKING";
+  let system_state: SystemState = "AVOID";
+  let peak_price = 0.0;
+  let peak_rsi = 0.0;
+  let peak_macd = 0.0;
+  let prev_roc21 = 0.0;
+  // ────────────────────────────────────────────────────────────────────────────
 
   for (let fi = 0; fi < filteredBars.length; fi++) {
     const i = fi + offset;
     const bar = filteredBars[fi];
 
+    // ── Step A: Calculate current indicators & rolling thresholds ────────────
+    const T_RSI_upper = rollingPercentile(
+      rsi,
+      i,
+      THRESHOLD_WINDOW,
+      THRESHOLD_PCT,
+    );
+    const T_MFI_upper = rollingPercentile(
+      mfi,
+      i,
+      THRESHOLD_WINDOW,
+      THRESHOLD_PCT,
+    );
+
+    const cur_rsi = isNum(rsi, i) ? getNum(rsi, i) : 0;
+    const cur_mfi = isNum(mfi, i) ? getNum(mfi, i) : 0;
+    const cur_roc21 = isNum(roc21, i) ? getNum(roc21, i) : 0;
+    const cur_macd = isNum(macd, i) ? getNum(macd, i) : 0;
+    const cur_price = bar.close;
+    // ────────────────────────────────────────────────────────────────────────
+
     if (!inPosition) {
+      // Handle entry logic
       if (lastExitIdx === null) {
-        // First entry — use first bar as auto-entry
-        if (fi === 0) {
-          inPosition = true;
-          entryPrice = bar.close;
-          entryDate = bar.date;
-          entryIdx = i;
-        }
+        // First bar: only auto-enter if Rule Alpha is satisfied (system not in AVOID)
+        // On day 0 there are no prior bars, so thresholds are null — treat as AVOID blocked
+        // (entry happens when system_state transitions to TRACKING)
+        // We still run the state machine below so that on day 0 if alpha fires, we enter
       } else {
-        // Re-entry after a previous exit — apply cooling-off + 3-condition rules
+        // Re-entry after exit: cooling-off + 3-condition check
         const coolOffComplete = i >= lastExitIdx + 3;
         if (
           coolOffComplete &&
           isNum(roc21, i) &&
           isNum(rsi, i) &&
           isNum(mfi, i) &&
-          getNum(roc21, i) > 0 &&
-          getNum(rsi, i) > 50 &&
-          getNum(mfi, i) > 45
+          cur_roc21 > 0 &&
+          cur_rsi > 50 &&
+          cur_mfi > 45
         ) {
           inPosition = true;
           entryPrice = bar.close;
           entryDate = bar.date;
           entryIdx = i;
-          // Reset alpha peak for the new trade
-          alphaPeakIdx = null;
-          alphaPeakPrice = null;
-          alphaPeakRSI = null;
-          alphaPeakMACD = null;
-        }
-      }
-      equityCurve.push({
-        date: bar.date,
-        equity: Number.parseFloat(equity.toFixed(2)),
-      });
-    } else {
-      // --- Divergence-Decay Exit Protocol ---
-
-      // Dynamic upper threshold = rolling 85th percentile (window 50)
-      const T_RSI_upper = rollingPercentile(rsi, i, 50, 0.85);
-      const T_MFI_upper = rollingPercentile(mfi, i, 50, 0.85);
-
-      // Rule Zero: AVOID — both RSI and MFI are at or below their adaptive upper thresholds
-      // I_avoid(t) = RSI(t) <= T_RSI_upper(t) AND MFI(t) <= T_MFI_upper(t)
-      // (computed but used only for state reporting; does not block the existing trade)
-      void (
-        (T_RSI_upper === null || getNum(rsi, i) <= T_RSI_upper) &&
-        (T_MFI_upper === null || getNum(mfi, i) <= T_MFI_upper)
-      );
-
-      // Rule Alpha — RSI OR MFI breaches its adaptive upper threshold
-      const ruleAlpha =
-        (T_RSI_upper !== null &&
-          isNum(rsi, i) &&
-          getNum(rsi, i) > T_RSI_upper) ||
-        (T_MFI_upper !== null && isNum(mfi, i) && getNum(mfi, i) > T_MFI_upper);
-
-      if (ruleAlpha && alphaPeakIdx === null) {
-        // Record the FIRST peak only — never overwrite; the original peak is the divergence reference
-        alphaPeakIdx = i;
-        alphaPeakPrice = bar.close;
-        alphaPeakRSI = isNum(rsi, i) ? getNum(rsi, i) : null;
-        alphaPeakMACD = isNum(macd, i) ? getNum(macd, i) : null;
-      }
-
-      let exitReason = "";
-
-      // Final Execution only evaluates AFTER a peak has been established
-      if (
-        alphaPeakIdx !== null &&
-        alphaPeakPrice !== null &&
-        alphaPeakRSI !== null &&
-        alphaPeakMACD !== null &&
-        i > alphaPeakIdx
-      ) {
-        // Rule Beta — ROC21(t) < ROC21(t-1): current day deceleration
-        const ruleBeta =
-          i >= 1 &&
-          isNum(roc21, i) &&
-          isNum(roc21, i - 1) &&
-          getNum(roc21, i) < getNum(roc21, i - 1);
-
-        // Rule Gamma — price >= peak AND RSI < peak RSI AND MACD < peak MACD
-        const ruleGamma =
-          isNum(rsi, i) &&
-          isNum(macd, i) &&
-          bar.close >= alphaPeakPrice &&
-          getNum(rsi, i) < alphaPeakRSI &&
-          getNum(macd, i) < alphaPeakMACD;
-
-        // Final Execution — all three align
-        if (ruleBeta && ruleGamma) {
-          exitReason = "Divergence-Decay Exit";
+          // Reset state machine for new trade
+          system_state = "AVOID";
+          peak_price = 0.0;
+          peak_rsi = 0.0;
+          peak_macd = 0.0;
+          prev_roc21 = 0.0;
         }
       }
 
-      if (exitReason) {
-        const exitPrice = bar.close;
-        const retPct = ((exitPrice - entryPrice) / entryPrice) * 100;
-        trades.push({
-          entryDate,
-          exitDate: bar.date,
-          entryPrice,
-          exitPrice,
-          returnPct: Number.parseFloat(retPct.toFixed(2)),
-          exitReason,
-          bars: i - entryIdx,
+      // If still not in position after re-entry check, run state machine
+      // to see if this is the first entry (day 0 is handled below in state machine)
+      if (!inPosition) {
+        // ── Step B: Rule Zero (AVOID block) ──────────────────────────────────
+        if (system_state === "AVOID") {
+          const rsiAbove = T_RSI_upper !== null && cur_rsi > T_RSI_upper;
+          const mfiAbove = T_MFI_upper !== null && cur_mfi > T_MFI_upper;
+
+          if (!rsiAbove && !mfiAbove) {
+            // Stay AVOID — no action
+          } else {
+            // Transition: broken out → go to Step C
+            // ── Step C: Rule Alpha — initial peak lock ────────────────────────
+            peak_price = cur_price;
+            peak_rsi = cur_rsi;
+            peak_macd = cur_macd;
+            system_state = "TRACKING";
+
+            // Auto-enter on first transition out of AVOID (first bar)
+            if (lastExitIdx === null) {
+              inPosition = true;
+              entryPrice = bar.close;
+              entryDate = bar.date;
+              entryIdx = i;
+            }
+          }
+        } else if (system_state === "TRACKING") {
+          // ── Step C: Rule Alpha — update peak if momentum pushing higher ───
+          const rsiAbove = T_RSI_upper !== null && cur_rsi > T_RSI_upper;
+          const mfiAbove = T_MFI_upper !== null && cur_mfi > T_MFI_upper;
+          if (rsiAbove || mfiAbove) {
+            // Momentum still in upper zone — update peak to track the highest point
+            if (cur_rsi > peak_rsi || cur_mfi > (T_MFI_upper ?? 0)) {
+              peak_price = cur_price;
+              peak_rsi = cur_rsi;
+              peak_macd = cur_macd;
+            }
+          }
+        }
+
+        // ── Step F: Update prev_roc21 for next day ─────────────────────────
+        prev_roc21 = cur_roc21;
+
+        equityCurve.push({
+          date: bar.date,
+          equity: Number.parseFloat(equity.toFixed(2)),
         });
+        continue;
+      }
+    }
 
-        const tradeReturn = retPct / 100;
-        dailyReturns.push(tradeReturn);
-        equity *= 1 + tradeReturn;
-        if (equity > peak) peak = equity;
-        const dd = ((peak - equity) / peak) * 100;
-        if (dd > maxDrawdown) maxDrawdown = dd;
+    // ── In position: run state machine ──────────────────────────────────────
 
-        inPosition = false;
-        entryPrice = 0;
-        lastExitIdx = i;
+    // ── Step B: Rule Zero ──────────────────────────────────────────────────
+    if (system_state === "AVOID") {
+      const rsiAbove = T_RSI_upper !== null && cur_rsi > T_RSI_upper;
+      const mfiAbove = T_MFI_upper !== null && cur_mfi > T_MFI_upper;
 
-        // Clear alpha peak state after exit
-        alphaPeakIdx = null;
-        alphaPeakPrice = null;
-        alphaPeakRSI = null;
-        alphaPeakMACD = null;
+      if (!rsiAbove && !mfiAbove) {
+        // Stay AVOID — no exit possible
+        // ── Step F: Update memory ────────────────────────────────────────────
+        prev_roc21 = cur_roc21;
+        equityCurve.push({
+          date: bar.date,
+          equity: Number.parseFloat(equity.toFixed(2)),
+        });
+        continue;
       }
 
+      // Transition from AVOID → TRACKING via Rule Alpha
+      // ── Step C: Lock initial peak ────────────────────────────────────────
+      peak_price = cur_price;
+      peak_rsi = cur_rsi;
+      peak_macd = cur_macd;
+      system_state = "TRACKING";
+
+      // ── Step F: Update memory ──────────────────────────────────────────────
+      prev_roc21 = cur_roc21;
       equityCurve.push({
         date: bar.date,
         equity: Number.parseFloat(equity.toFixed(2)),
       });
+      continue;
     }
+
+    // ── system_state === "TRACKING" ────────────────────────────────────────
+
+    // ── Step C: Rule Alpha — update peak if momentum pushing higher ─────────
+    {
+      const rsiAbove = T_RSI_upper !== null && cur_rsi > T_RSI_upper;
+      const mfiAbove = T_MFI_upper !== null && cur_mfi > T_MFI_upper;
+      if (rsiAbove || mfiAbove) {
+        if (cur_rsi > peak_rsi || cur_mfi > (T_MFI_upper ?? 0)) {
+          peak_price = cur_price;
+          peak_rsi = cur_rsi;
+          peak_macd = cur_macd;
+        }
+      }
+    }
+
+    // ── Step D: Rule Beta (deceleration filter) ─────────────────────────────
+    const ruleBeta = cur_roc21 < prev_roc21;
+
+    let exitReason = "";
+
+    if (ruleBeta) {
+      // ── Step E: Rule Gamma (divergence-decay execution) ─────────────────
+      const ruleGamma =
+        cur_price >= peak_price && cur_rsi < peak_rsi && cur_macd < peak_macd;
+
+      if (ruleGamma) {
+        exitReason = "Divergence-Decay Exit";
+      }
+    }
+
+    if (exitReason) {
+      const exitPrice = bar.close;
+      const retPct = ((exitPrice - entryPrice) / entryPrice) * 100;
+      trades.push({
+        entryDate,
+        exitDate: bar.date,
+        entryPrice,
+        exitPrice,
+        returnPct: Number.parseFloat(retPct.toFixed(2)),
+        exitReason,
+        bars: i - entryIdx,
+      });
+
+      const tradeReturn = retPct / 100;
+      dailyReturns.push(tradeReturn);
+      equity *= 1 + tradeReturn;
+      if (equity > peak) peak = equity;
+      const dd = ((peak - equity) / peak) * 100;
+      if (dd > maxDrawdown) maxDrawdown = dd;
+
+      inPosition = false;
+      entryPrice = 0;
+      lastExitIdx = i;
+
+      // Reset state machine after exit
+      system_state = "AVOID";
+      peak_price = 0.0;
+      peak_rsi = 0.0;
+      peak_macd = 0.0;
+    }
+
+    // ── Step F: Update prev_roc21 for next day ──────────────────────────────
+    prev_roc21 = cur_roc21;
+
+    equityCurve.push({
+      date: bar.date,
+      equity: Number.parseFloat(equity.toFixed(2)),
+    });
   }
 
   // Compute stats
@@ -245,7 +326,6 @@ export function runBacktest(
 
   const totalReturn = equity - 100;
 
-  // Sharpe
   let sharpeRatio = 0;
   if (dailyReturns.length > 1) {
     const mean = dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length;
