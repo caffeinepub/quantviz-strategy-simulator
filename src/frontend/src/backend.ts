@@ -89,14 +89,85 @@ export class ExternalBlob {
         return this;
     }
 }
+export interface HttpResponsePayload {
+    status: bigint;
+    body: Uint8Array;
+    headers: Array<{
+        value: string;
+        name: string;
+    }>;
+}
 export interface backendInterface {
-    fetchStockData: (symbol: string, startTs: bigint, endTs: bigint) => Promise<{ ok: string } | { err: string }>;
+    fetchStockData(symbol: string, startTs: bigint, endTs: bigint): Promise<{
+        __kind__: "ok";
+        ok: string;
+    } | {
+        __kind__: "err";
+        err: string;
+    }>;
+    transformResponse(args: {
+        context: Uint8Array;
+        response: HttpResponsePayload;
+    }): Promise<HttpResponsePayload>;
 }
 export class Backend implements backendInterface {
     constructor(private actor: ActorSubclass<_SERVICE>, private _uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, private _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, private processError?: (error: unknown) => never){}
-    async fetchStockData(symbol: string, startTs: bigint, endTs: bigint): Promise<{ ok: string } | { err: string }> {
-        return this.actor.fetchStockData(symbol, startTs, endTs);
+    async fetchStockData(arg0: string, arg1: bigint, arg2: bigint): Promise<{
+        __kind__: "ok";
+        ok: string;
+    } | {
+        __kind__: "err";
+        err: string;
+    }> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.fetchStockData(arg0, arg1, arg2);
+                return from_candid_variant_n1(this._uploadFile, this._downloadFile, result);
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.fetchStockData(arg0, arg1, arg2);
+            return from_candid_variant_n1(this._uploadFile, this._downloadFile, result);
+        }
     }
+    async transformResponse(arg0: {
+        context: Uint8Array;
+        response: HttpResponsePayload;
+    }): Promise<HttpResponsePayload> {
+        if (this.processError) {
+            try {
+                const result = await this.actor.transformResponse(arg0);
+                return result;
+            } catch (e) {
+                this.processError(e);
+                throw new Error("unreachable");
+            }
+        } else {
+            const result = await this.actor.transformResponse(arg0);
+            return result;
+        }
+    }
+}
+function from_candid_variant_n1(_uploadFile: (file: ExternalBlob) => Promise<Uint8Array>, _downloadFile: (file: Uint8Array) => Promise<ExternalBlob>, value: {
+    ok: string;
+} | {
+    err: string;
+}): {
+    __kind__: "ok";
+    ok: string;
+} | {
+    __kind__: "err";
+    err: string;
+} {
+    return "ok" in value ? {
+        __kind__: "ok",
+        ok: value.ok
+    } : "err" in value ? {
+        __kind__: "err",
+        err: value.err
+    } : value;
 }
 export interface CreateActorOptions {
     agent?: Agent;

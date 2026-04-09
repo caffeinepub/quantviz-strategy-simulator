@@ -1,0 +1,29 @@
+// Version: 1.0.0
+type HttpRequestArgs__893152371 =
+  {
+    body : ?Blob;
+    headers : [{name : Text; value : Text}];
+    max_response_bytes : ?Nat64;
+    method : {#get; #head; #post};
+    transform :
+      ?{
+         context : Blob;
+         function :
+           shared query {
+                          context : Blob;
+                          response : HttpResponsePayload__786650749
+                        } ->
+             async HttpResponsePayload__786650749
+       };
+    url : Text
+  };
+type HttpResponsePayload__786650749 =
+  {body : Blob; headers : [{name : Text; value : Text}]; status : Nat};
+actor {
+  stable ic :
+    actor {
+      http_request :
+        shared HttpRequestArgs__893152371 ->
+          async HttpResponsePayload__786650749
+    }
+};

@@ -1,0 +1,21 @@
+type HttpResponsePayload = 
+ record {
+   body: blob;
+   headers: vec record {
+                  name: text;
+                  value: text;
+                };
+   status: nat;
+ };
+service : {
+  fetchStockData: (symbol: text, startTs: int, endTs: int) ->
+   (variant {
+      err: text;
+      ok: text;
+    });
+  transformResponse: (args:
+   record {
+     context: blob;
+     response: HttpResponsePayload;
+   }) -> (HttpResponsePayload) query;
+}

@@ -1,56 +1,30 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
-import type { backendInterface } from "../backend";
-import { createActorWithConfig } from "../config";
-import { useInternetIdentity } from "./useInternetIdentity";
+import { useActor as useCaffeineActor } from "@caffeineai/core-infrastructure";
+import { createActor } from "../backend";
 
-const ACTOR_QUERY_KEY = "actor";
-export function useActor() {
-  const { identity } = useInternetIdentity();
-  const queryClient = useQueryClient();
-  const actorQuery = useQuery<backendInterface>({
-    queryKey: [ACTOR_QUERY_KEY, identity?.getPrincipal().toString()],
-    queryFn: async () => {
-      const isAuthenticated = !!identity;
+export interface StockDataResult {
+  ok: string;
+  err?: never;
+}
 
-      if (!isAuthenticated) {
-        // Return anonymous actor if not authenticated
-        return await createActorWithConfig();
-      }
+export interface StockDataError {
+  err: string;
+  ok?: never;
+}
 
-      const actorOptions = {
-        agentOptions: {
-          identity,
-        },
-      };
+export type StockDataResponse = StockDataResult | StockDataError;
 
-      const actor = await createActorWithConfig(actorOptions);
-      return actor;
-    },
-    // Only refetch when identity changes
-    staleTime: Number.POSITIVE_INFINITY,
-    // This will cause the actor to be recreated when the identity changes
-    enabled: true,
-  });
+export interface AppActor {
+  fetchStockData: (
+    symbol: string,
+    fromTs: bigint,
+    toTs: bigint,
+  ) => Promise<StockDataResponse>;
+}
 
-  // When the actor changes, invalidate dependent queries
-  useEffect(() => {
-    if (actorQuery.data) {
-      queryClient.invalidateQueries({
-        predicate: (query) => {
-          return !query.queryKey.includes(ACTOR_QUERY_KEY);
-        },
-      });
-      queryClient.refetchQueries({
-        predicate: (query) => {
-          return !query.queryKey.includes(ACTOR_QUERY_KEY);
-        },
-      });
-    }
-  }, [actorQuery.data, queryClient]);
-
-  return {
-    actor: actorQuery.data || null,
-    isFetching: actorQuery.isFetching,
-  };
+export function useActor(): { actor: AppActor | null; isFetching: boolean } {
+  // createActor from backend.ts wraps the generated canister bindings.
+  // We cast to AppActor because the backendInterface types are auto-generated
+  // and may lag behind the actual canister implementation.
+  const { actor, isFetching } = useCaffeineActor(createActor);
+  return { actor: actor as unknown as AppActor | null, isFetching };
 }

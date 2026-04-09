@@ -10,6 +10,12 @@ export interface Trade {
   bars: number;
 }
 
+export interface BacktestAlert {
+  date: string;
+  message: string;
+  level: "info" | "warning" | "critical";
+}
+
 export interface BacktestResult {
   trades: Trade[];
   totalReturn: number;
@@ -21,6 +27,7 @@ export interface BacktestResult {
   avgLoss: number;
   equityCurve: { date: string; equity: number }[];
   openTrade: { entryDate: string; entryPrice: number; entryIdx: number } | null;
+  alerts: BacktestAlert[];
 }
 
 function getNum(arr: (number | null)[], i: number): number {
@@ -85,6 +92,7 @@ export function runBacktest(
   let peak = equity;
   let maxDrawdown = 0;
   const dailyReturns: number[] = [];
+  const alerts: BacktestAlert[] = [];
 
   // ── State Machine Memory (Step 1: Initialize) ──────────────────────────────
   // Thresholds use a 20-day rolling window (localized std/mean per user spec)
@@ -97,6 +105,10 @@ export function runBacktest(
   let peak_rsi = 0.0;
   let peak_macd = 0.0;
   let prev_roc21 = 0.0;
+  // Alert dedup flags (reset per trade cycle)
+  let betaAlerted = false;
+  let gammaAlerted = false;
+  let avoidAlerted = false;
   // ────────────────────────────────────────────────────────────────────────────
 
   for (let fi = 0; fi < filteredBars.length; fi++) {
@@ -216,6 +228,15 @@ export function runBacktest(
 
       if (!rsiAbove && !mfiAbove) {
         // Stay AVOID — no exit possible
+        // Fire AVOID alert once per cycle while in position
+        if (!avoidAlerted) {
+          avoidAlerted = true;
+          alerts.push({
+            date: bar.date,
+            message: `AVOID — Algorithm in capital preservation mode. No momentum peak detected yet. RSI ${cur_rsi.toFixed(1)} | MFI ${cur_mfi.toFixed(1)} (both below adaptive thresholds).`,
+            level: "warning",
+          });
+        }
         // ── Step F: Update memory ────────────────────────────────────────────
         prev_roc21 = cur_roc21;
         equityCurve.push({
@@ -231,6 +252,15 @@ export function runBacktest(
       peak_rsi = cur_rsi;
       peak_macd = cur_macd;
       system_state = "TRACKING";
+      // Reset dedup flags for the new TRACKING cycle
+      avoidAlerted = false;
+      betaAlerted = false;
+      gammaAlerted = false;
+      alerts.push({
+        date: bar.date,
+        message: `RULE ALPHA — Momentum peak detected. Peak logged: Price=${cur_price.toFixed(2)}, RSI=${cur_rsi.toFixed(1)}, MACD=${cur_macd.toFixed(2)}. System now TRACKING for divergence.`,
+        level: "warning",
+      });
 
       // ── Step F: Update memory ──────────────────────────────────────────────
       prev_roc21 = cur_roc21;
@@ -259,15 +289,33 @@ export function runBacktest(
     // ── Step D: Rule Beta (deceleration filter) ─────────────────────────────
     const ruleBeta = cur_roc21 < prev_roc21;
 
+    // ── Step E: Rule Gamma (divergence-decay execution) ─────────────────────
+    const ruleGamma =
+      cur_price >= peak_price && cur_rsi < peak_rsi && cur_macd < peak_macd;
+
     let exitReason = "";
 
-    if (ruleBeta) {
-      // ── Step E: Rule Gamma (divergence-decay execution) ─────────────────
-      const ruleGamma =
-        cur_price >= peak_price && cur_rsi < peak_rsi && cur_macd < peak_macd;
-
-      if (ruleGamma) {
-        exitReason = "Divergence-Decay Exit";
+    if (ruleBeta && ruleGamma) {
+      exitReason = "Divergence-Decay Exit";
+    } else if (ruleBeta && !ruleGamma) {
+      // Beta triggered but Gamma not yet — pre-exit warning (fire once per cycle)
+      if (!betaAlerted) {
+        betaAlerted = true;
+        alerts.push({
+          date: bar.date,
+          message: `RULE BETA — Momentum deceleration confirmed. ROC21 declining (${cur_roc21.toFixed(2)} < ${prev_roc21.toFixed(2)}). Watching for divergence...`,
+          level: "warning",
+        });
+      }
+    } else if (!ruleBeta && ruleGamma) {
+      // Gamma triggered but Beta not yet — pre-exit warning (fire once per cycle)
+      if (!gammaAlerted) {
+        gammaAlerted = true;
+        alerts.push({
+          date: bar.date,
+          message: `RULE GAMMA — Price/RSI/MACD divergence detected. Price holding at peak (${cur_price.toFixed(2)} ≥ ${peak_price.toFixed(2)}) while momentum decays (RSI ${cur_rsi.toFixed(1)} < peak ${peak_rsi.toFixed(1)}). Watching for deceleration...`,
+          level: "warning",
+        });
       }
     }
 
@@ -282,6 +330,12 @@ export function runBacktest(
         returnPct: Number.parseFloat(retPct.toFixed(2)),
         exitReason,
         bars: i - entryIdx,
+      });
+
+      alerts.push({
+        date: bar.date,
+        message: `EXIT SIGNAL — All conditions met: Alpha peak @ ${peak_price.toFixed(2)}, Beta (ROC21 decelerating: ${cur_roc21.toFixed(2)} < ${prev_roc21.toFixed(2)}), Gamma (RSI+MACD diverged). Exiting at ${exitPrice.toFixed(2)}.`,
+        level: "critical",
       });
 
       const tradeReturn = retPct / 100;
@@ -300,6 +354,9 @@ export function runBacktest(
       peak_price = 0.0;
       peak_rsi = 0.0;
       peak_macd = 0.0;
+      betaAlerted = false;
+      gammaAlerted = false;
+      avoidAlerted = false;
     }
 
     // ── Step F: Update prev_roc21 for next day ──────────────────────────────
@@ -351,5 +408,6 @@ export function runBacktest(
     avgLoss: Number.parseFloat(avgLoss.toFixed(2)),
     equityCurve,
     openTrade,
+    alerts,
   };
 }

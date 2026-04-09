@@ -10,9 +10,21 @@ import type { ActorMethod } from '@icp-sdk/core/agent';
 import type { IDL } from '@icp-sdk/core/candid';
 import type { Principal } from '@icp-sdk/core/principal';
 
-export type FetchResult = { ok: string } | { err: string };
+export interface HttpResponsePayload {
+  'status' : bigint,
+  'body' : Uint8Array,
+  'headers' : Array<{ 'value' : string, 'name' : string }>,
+}
 export interface _SERVICE {
-  fetchStockData: ActorMethod<[string, bigint, bigint], FetchResult>;
+  'fetchStockData' : ActorMethod<
+    [string, bigint, bigint],
+    { 'ok' : string } |
+      { 'err' : string }
+  >,
+  'transformResponse' : ActorMethod<
+    [{ 'context' : Uint8Array, 'response' : HttpResponsePayload }],
+    HttpResponsePayload
+  >,
 }
 export declare const idlService: IDL.ServiceClass;
 export declare const idlInitArgs: IDL.Type[];

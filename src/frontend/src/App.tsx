@@ -109,6 +109,12 @@ export default function App() {
   const peakMacdRef = useRef(0.0);
   const prevRoc21Ref = useRef(0.0);
 
+  // Pre-exit alert dedup refs (reset when system transitions back to AVOID)
+  const betaAlertedRef = useRef(false);
+  const gammaAlertedRef = useRef(false);
+  // AVOID alert dedup ref (fire once per AVOID entry while in position)
+  const avoidAlertedRef = useRef(false);
+
   // Keep refs in sync
   useEffect(() => {
     inPositionRef.current = inPosition;
@@ -224,6 +230,15 @@ export default function App() {
         if (systemStateRef.current === "AVOID") {
           if (!rsiAbove && !mfiAbove) {
             // Stay AVOID — momentum insufficient
+            // Fire AVOID alert once per AVOID cycle (first day we're in position & AVOID)
+            if (!avoidAlertedRef.current) {
+              avoidAlertedRef.current = true;
+              addAlert({
+                day: dayIdx,
+                message: `AVOID — Algorithm in capital preservation mode. No momentum peak detected yet. RSI ${cur_rsi.toFixed(1)} | MFI ${cur_mfi.toFixed(1)} (both below adaptive thresholds).`,
+                level: "warning",
+              });
+            }
             addLog({
               day: dayIdx,
               type: "info",
@@ -246,9 +261,13 @@ export default function App() {
             rsi: cur_rsi,
             macd: cur_macd,
           });
+          // Reset dedup refs for the new TRACKING cycle
+          avoidAlertedRef.current = false;
+          betaAlertedRef.current = false;
+          gammaAlertedRef.current = false;
           addAlert({
             day: dayIdx,
-            message: `AVOID CLEARED — Momentum peak identified: RSI ${cur_rsi.toFixed(1)} vs threshold ${T_RSI_upper?.toFixed(1) ?? "n/a"} | MFI ${cur_mfi.toFixed(1)} vs threshold ${T_MFI_upper?.toFixed(1) ?? "n/a"}`,
+            message: `RULE ALPHA — Momentum peak detected. Peak logged: Price=${cur_price.toFixed(2)}, RSI=${cur_rsi.toFixed(1)}, MACD=${cur_macd.toFixed(2)}. System now TRACKING for divergence.`,
             level: "warning",
           });
           addLog({
@@ -288,52 +307,73 @@ export default function App() {
         // ── Step D: Rule Beta ─────────────────────────────────────────────────
         const ruleBeta = cur_roc21 < prevRoc21Ref.current;
 
-        if (ruleBeta) {
-          // ── Step E: Rule Gamma ───────────────────────────────────────────────
-          const ruleGamma =
-            cur_price >= peakPriceRef.current &&
-            cur_rsi < peakRsiRef.current &&
-            cur_macd < peakMacdRef.current;
+        // ── Step E: Rule Gamma ────────────────────────────────────────────────
+        const ruleGamma =
+          cur_price >= peakPriceRef.current &&
+          cur_rsi < peakRsiRef.current &&
+          cur_macd < peakMacdRef.current;
 
-          if (ruleGamma && openTradeRef.current) {
-            const entryPrice = openTradeRef.current.entryPrice;
-            const pnlPct = ((cur_price - entryPrice) / entryPrice) * 100;
-            const completed: TradeRecord = {
-              ...openTradeRef.current,
-              exitDay: dayIdx,
-              exitPrice: cur_price,
-              exitReason: "Divergence-Decay Exit",
-              pnlPct,
-            };
-            setCompletedTrades((prev) => [...prev, completed]);
-            setOpenTrade(null);
-            openTradeRef.current = null;
-            setInPosition(false);
-            inPositionRef.current = false;
-            setExitBanner("Divergence-Decay Exit");
-            addLog({
-              day: dayIdx,
-              type: "exit",
-              message: `EXIT [Divergence-Decay Exit] @ $${cur_price.toFixed(2)} | P&L ${pnlPct.toFixed(2)}%`,
-              module: "exit",
-            });
+        if (ruleBeta && ruleGamma && openTradeRef.current) {
+          // ── FINAL EXECUTION: Beta + Gamma both satisfied → EXIT ─────────────
+          const entryPrice = openTradeRef.current.entryPrice;
+          const pnlPct = ((cur_price - entryPrice) / entryPrice) * 100;
+          const completed: TradeRecord = {
+            ...openTradeRef.current,
+            exitDay: dayIdx,
+            exitPrice: cur_price,
+            exitReason: "Divergence-Decay Exit",
+            pnlPct,
+          };
+          setCompletedTrades((prev) => [...prev, completed]);
+          setOpenTrade(null);
+          openTradeRef.current = null;
+          setInPosition(false);
+          inPositionRef.current = false;
+          setExitBanner("Divergence-Decay Exit");
+          addLog({
+            day: dayIdx,
+            type: "exit",
+            message: `EXIT [Divergence-Decay Exit] @ $${cur_price.toFixed(2)} | P&L ${pnlPct.toFixed(2)}%`,
+            module: "exit",
+          });
+          addAlert({
+            day: dayIdx,
+            message: `EXIT SIGNAL — All conditions met: Alpha peak @ ${peakPriceRef.current.toFixed(2)}, Beta (ROC21 decelerating: ${cur_roc21.toFixed(2)} < ${prevRoc21Ref.current.toFixed(2)}), Gamma (RSI+MACD diverged). Exiting at ${cur_price.toFixed(2)}.`,
+            level: "critical",
+          });
+          lastExitPriceRef.current = cur_price;
+          const coolUntil = dayIdx + 3;
+          setCoolingOffUntilDay(coolUntil);
+          coolingOffUntilDayRef.current = coolUntil;
+          // Reset state machine
+          systemStateRef.current = "AVOID";
+          peakPriceRef.current = 0.0;
+          peakRsiRef.current = 0.0;
+          peakMacdRef.current = 0.0;
+          betaAlertedRef.current = false;
+          gammaAlertedRef.current = false;
+          avoidAlertedRef.current = false;
+          setSystemState("AVOID");
+          setStateMachinePeak(null);
+        } else if (ruleBeta && !ruleGamma) {
+          // Beta triggered but Gamma not yet — pre-exit warning (fire once per cycle)
+          if (!betaAlertedRef.current) {
+            betaAlertedRef.current = true;
             addAlert({
               day: dayIdx,
-              message:
-                "DIVERGENCE-DECAY EXIT triggered — Beta+Gamma alignment confirmed",
-              level: "critical",
+              message: `RULE BETA — Momentum deceleration confirmed. ROC21 declining (${cur_roc21.toFixed(2)} < ${prevRoc21Ref.current.toFixed(2)}). Watching for divergence...`,
+              level: "warning",
             });
-            lastExitPriceRef.current = cur_price;
-            const coolUntil = dayIdx + 3;
-            setCoolingOffUntilDay(coolUntil);
-            coolingOffUntilDayRef.current = coolUntil;
-            // Reset state machine
-            systemStateRef.current = "AVOID";
-            peakPriceRef.current = 0.0;
-            peakRsiRef.current = 0.0;
-            peakMacdRef.current = 0.0;
-            setSystemState("AVOID");
-            setStateMachinePeak(null);
+          }
+        } else if (!ruleBeta && ruleGamma) {
+          // Gamma triggered but Beta not yet — pre-exit warning (fire once per cycle)
+          if (!gammaAlertedRef.current) {
+            gammaAlertedRef.current = true;
+            addAlert({
+              day: dayIdx,
+              message: `RULE GAMMA — Price/RSI/MACD divergence detected. Price holding at peak (${cur_price.toFixed(2)} ≥ ${peakPriceRef.current.toFixed(2)}) while momentum decays (RSI ${cur_rsi.toFixed(1)} < peak ${peakRsiRef.current.toFixed(1)}). Watching for deceleration...`,
+              level: "warning",
+            });
           }
         }
       } else {
@@ -368,6 +408,9 @@ export default function App() {
               peakRsiRef.current = 0.0;
               peakMacdRef.current = 0.0;
               prevRoc21Ref.current = 0.0;
+              betaAlertedRef.current = false;
+              gammaAlertedRef.current = false;
+              avoidAlertedRef.current = false;
               setSystemState("AVOID");
               setStateMachinePeak(null);
               addLog({
@@ -430,6 +473,9 @@ export default function App() {
     peakRsiRef.current = 0.0;
     peakMacdRef.current = 0.0;
     prevRoc21Ref.current = 0.0;
+    betaAlertedRef.current = false;
+    gammaAlertedRef.current = false;
+    avoidAlertedRef.current = false;
     setSystemState("AVOID");
     setStateMachinePeak(null);
 

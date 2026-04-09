@@ -8,18 +8,55 @@
 
 import { IDL } from '@icp-sdk/core/candid';
 
-const FetchResult = IDL.Variant({ ok: IDL.Text, err: IDL.Text });
+export const HttpResponsePayload = IDL.Record({
+  'status' : IDL.Nat,
+  'body' : IDL.Vec(IDL.Nat8),
+  'headers' : IDL.Vec(IDL.Record({ 'value' : IDL.Text, 'name' : IDL.Text })),
+});
 
 export const idlService = IDL.Service({
-  fetchStockData: IDL.Func([IDL.Text, IDL.Int, IDL.Int], [FetchResult], []),
+  'fetchStockData' : IDL.Func(
+      [IDL.Text, IDL.Int, IDL.Int],
+      [IDL.Variant({ 'ok' : IDL.Text, 'err' : IDL.Text })],
+      [],
+    ),
+  'transformResponse' : IDL.Func(
+      [
+        IDL.Record({
+          'context' : IDL.Vec(IDL.Nat8),
+          'response' : HttpResponsePayload,
+        }),
+      ],
+      [HttpResponsePayload],
+      ['query'],
+    ),
 });
 
 export const idlInitArgs = [];
 
 export const idlFactory = ({ IDL }) => {
-  const FetchResult = IDL.Variant({ ok: IDL.Text, err: IDL.Text });
+  const HttpResponsePayload = IDL.Record({
+    'status' : IDL.Nat,
+    'body' : IDL.Vec(IDL.Nat8),
+    'headers' : IDL.Vec(IDL.Record({ 'value' : IDL.Text, 'name' : IDL.Text })),
+  });
+  
   return IDL.Service({
-    fetchStockData: IDL.Func([IDL.Text, IDL.Int, IDL.Int], [FetchResult], []),
+    'fetchStockData' : IDL.Func(
+        [IDL.Text, IDL.Int, IDL.Int],
+        [IDL.Variant({ 'ok' : IDL.Text, 'err' : IDL.Text })],
+        [],
+      ),
+    'transformResponse' : IDL.Func(
+        [
+          IDL.Record({
+            'context' : IDL.Vec(IDL.Nat8),
+            'response' : HttpResponsePayload,
+          }),
+        ],
+        [HttpResponsePayload],
+        ['query'],
+      ),
   });
 };
 
